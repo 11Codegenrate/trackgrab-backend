@@ -1,17 +1,21 @@
 const express = require("express");
 const cors = require("cors");
 const { exec, spawn } = require("child_process");
+const os = require("os");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-// Health check — keeps Render from sleeping (ping this every 5 mins)
+// Health check — keeps the process reachable (ping this to verify it's up).
 app.get("/", (req, res) => {
   res.json({ status: "TrackGrab server is running ✅" });
 });
 
-// Get track info (title, artwork, duration)
+// Get track info (title, artwork, duration).
 app.get("/info", async (req, res) => {
   const url = req.query.url;
   if (!url || !url.includes("soundcloud.com")) {
@@ -45,8 +49,8 @@ app.get("/info", async (req, res) => {
   );
 });
 
-// Supported download formats → yt-dlp extraction args, file extension, MIME type.
-// SoundCloud is audio-only, so mp4/m4a resolve to an ISO (MP4) audio container.
+// Supported formats → yt-dlp extraction args, download-name extension, MIME type.
+// SoundCloud is audio-only, so mp4/m4a both resolve to an MP4 (ISO) audio container.
 const DOWNLOAD_FORMATS = {
   mp3:  { args: ["-x", "--audio-format", "mp3",  "--audio-quality", "0"], ext: "mp3",  mime: "audio/mpeg" },
   m4a:  { args: ["-x", "--audio-format", "m4a",  "--audio-quality", "0"], ext: "m4a",  mime: "audio/mp4"  },
@@ -55,7 +59,10 @@ const DOWNLOAD_FORMATS = {
   flac: { args: ["-x", "--audio-format", "flac"],                         ext: "flac", mime: "audio/flac" },
 };
 
-// Stream/download the track in the requested audio format (defaults to MP3).
+// Download in the requested audio format.
+// yt-dlp's format conversion is a post-processor that needs a real file to work
+// on — piping to stdout (-o -) skips it and streams SoundCloud's raw source
+// (usually M4A) instead. So we convert to a temp file, stream it, then delete it.
 app.get("/download", (req, res) => {
   const url = req.query.url;
   const title = req.query.title || "track";
@@ -67,32 +74,75 @@ app.get("/download", (req, res) => {
   }
 
   const safeTitle = title.replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || "track";
+  const workId = crypto.randomBytes(8).toString("hex");
+  const prefix = `trackgrab-${workId}`;
+  const outTemplate = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
 
-  res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt.ext}"`);
-  res.setHeader("Content-Type", fmt.mime);
+  function cleanup() {
+    try {
+      const dir = os.tmpdir();
+      for (const f of fs.readdirSync(dir)) {
+        if (f.startsWith(prefix)) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  }
 
   const ytdlp = spawn("yt-dlp", [
     ...fmt.args,
-    "-o", "-",       // output to stdout
+    "-o", outTemplate,
     "--no-playlist",
+    "--no-progress",
     url,
   ]);
 
-  ytdlp.stdout.pipe(res);
-
-  ytdlp.stderr.on("data", (data) => {
-    console.error("yt-dlp:", data.toString());
+  let stderr = "";
+  ytdlp.stderr.on("data", (d) => {
+    stderr += d.toString();
   });
 
   ytdlp.on("error", (err) => {
     console.error("spawn error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Download failed" });
-    }
+    cleanup();
+    if (!res.headersSent) res.status(500).json({ error: "Download failed" });
   });
 
+  ytdlp.on("close", (code) => {
+    // Find whatever file yt-dlp actually produced (e.g. mp4 → .m4a).
+    let produced = null;
+    try {
+      const dir = os.tmpdir();
+      const match = fs.readdirSync(dir).find((f) => f.startsWith(prefix + "."));
+      if (match) produced = path.join(dir, match);
+    } catch (e) {}
+
+    if (code !== 0 || !produced) {
+      console.error("yt-dlp failed (code " + code + "):", stderr);
+      cleanup();
+      if (!res.headersSent) res.status(500).json({ error: "Conversion failed" });
+      return;
+    }
+
+    res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt.ext}"`);
+    res.setHeader("Content-Type", fmt.mime);
+    try {
+      res.setHeader("Content-Length", fs.statSync(produced).size);
+    } catch (e) {}
+
+    const stream = fs.createReadStream(produced);
+    stream.on("error", () => {
+      cleanup();
+      if (!res.headersSent) res.status(500).json({ error: "Read failed" });
+    });
+    stream.on("close", cleanup);
+    stream.pipe(res);
+  });
+
+  // Client aborted before we finished — stop yt-dlp and clean up.
   req.on("close", () => {
-    ytdlp.kill();
+    if (ytdlp.exitCode === null) ytdlp.kill();
+    cleanup();
   });
 });
 
