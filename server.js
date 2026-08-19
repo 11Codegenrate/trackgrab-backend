@@ -29,19 +29,36 @@ function bestThumb(obj) {
   return "";
 }
 
-// Map one yt-dlp track object to the frontend "track" shape.
-function trackShape(t) {
+// Humanize a SoundCloud track slug into a title (SC permalinks come from the
+// title): ".../you-prod-saint-mike" -> "You Prod Saint Mike".
+function titleFromUrl(u) {
+  try {
+    const parts = new URL(u).pathname.split("/").filter(Boolean);
+    let slug = parts.length ? parts[parts.length - 1] : "";
+    slug = decodeURIComponent(slug).replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!slug) return "";
+    return slug.replace(/\b\w/g, (c) => c.toUpperCase());
+  } catch (e) {
+    return "";
+  }
+}
+
+// Map one flat-playlist entry to the frontend "track" shape.
+function flatTrackShape(e) {
+  const turl = e.url || e.webpage_url || "";
   return {
-    title: t.title || "",
-    url: t.webpage_url || t.url || t.original_url || "",
-    uploader: t.uploader || "",
-    duration: typeof t.duration === "number" ? t.duration : null,
-    thumbnail: bestThumb(t),
+    title: e.title || titleFromUrl(turl),
+    url: turl,
+    uploader: e.uploader || "",
+    duration: typeof e.duration === "number" ? e.duration : null,
+    thumbnail: bestThumb(e),
   };
 }
 
-// Get track info, or a playlist. yt-dlp --dump-json emits ONE JSON object per
-// line: a single line for a track, one line per track for a /sets/ playlist.
+// Get track info, or a playlist. One yt-dlp call: --flat-playlist means a
+// /sets/ URL returns the playlist with a lightweight entries[] list (1 request
+// to SoundCloud) instead of resolving all 50 tracks (which gets rate-limited).
+// A single-track URL returns its full metadata (flat-playlist is a no-op there).
 app.get("/info", (req, res) => {
   const url = req.query.url;
   if (!url || !url.includes("soundcloud.com")) {
@@ -49,51 +66,51 @@ app.get("/info", (req, res) => {
   }
 
   exec(
-    `yt-dlp --dump-json --no-playlist --no-warnings "${url}"`,
-    { timeout: 90000, maxBuffer: 64 * 1024 * 1024 },
+    `yt-dlp -J --flat-playlist --no-playlist --no-warnings "${url}"`,
+    { timeout: 45000, maxBuffer: 32 * 1024 * 1024 },
     (err, stdout, stderr) => {
       if (err) {
         console.error("yt-dlp info error:", stderr);
         return res.status(500).json({ error: "Could not fetch track info" });
       }
 
-      const lines = String(stdout).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-      let items;
+      let meta;
       try {
-        items = lines.map((l) => JSON.parse(l));
+        meta = JSON.parse(stdout);
       } catch (e) {
         return res.status(500).json({ error: "Failed to parse track data" });
       }
-      if (!items.length) {
+      if (!meta) {
         return res.status(500).json({ error: "No track data" });
       }
 
-      // Multiple objects → a playlist / set.
-      if (items.length > 1) {
-        const first = items[0];
+      // Playlist / set.
+      if (Array.isArray(meta.entries)) {
+        const tracks = meta.entries
+          .filter((e) => e && (e.url || e.webpage_url))
+          .map(flatTrackShape);
         return res.json({
           type: "playlist",
           header: {
-            playlist_title: first.playlist_title || first.album || first.playlist || "Playlist",
-            uploader: first.playlist_uploader || first.album_artist || "",
-            uploader_url: "",
-            thumbnail: bestThumb(first),
+            playlist_title: meta.title || meta.album || "Playlist",
+            uploader: meta.uploader || meta.album_artist || "",
+            uploader_url: meta.uploader_url || "",
+            thumbnail: bestThumb(meta),
           },
-          total: items.length,
-          tracks: items.map(trackShape),
+          total: meta.playlist_count || tracks.length,
+          tracks: tracks,
         });
       }
 
       // Single track — original response shape (unchanged).
-      const data = items[0];
       res.json({
-        title: data.title,
-        uploader: data.uploader,
-        thumbnail: data.thumbnail,
-        duration: data.duration,
-        description: data.description,
-        like_count: data.like_count,
-        view_count: data.view_count,
+        title: meta.title,
+        uploader: meta.uploader,
+        thumbnail: meta.thumbnail,
+        duration: meta.duration,
+        description: meta.description,
+        like_count: meta.like_count,
+        view_count: meta.view_count,
         url: url,
       });
     }
