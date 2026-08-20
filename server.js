@@ -117,15 +117,86 @@ app.get("/info", (req, res) => {
   );
 });
 
-// Supported formats → yt-dlp extraction args, download-name extension, MIME type.
+// Supported formats → yt-dlp target audio format, download-name extension, MIME.
 // SoundCloud is audio-only, so mp4/m4a both resolve to an MP4 (ISO) audio container.
+// `lossless` formats (WAV/FLAC) ignore bitrate; `canEmbed` = format supports tags/cover
+// (WAV has no usable tag container, so metadata embedding is skipped there).
 const DOWNLOAD_FORMATS = {
-  mp3:  { args: ["-x", "--audio-format", "mp3",  "--audio-quality", "0"], ext: "mp3",  mime: "audio/mpeg" },
-  m4a:  { args: ["-x", "--audio-format", "m4a",  "--audio-quality", "0"], ext: "m4a",  mime: "audio/mp4"  },
-  mp4:  { args: ["-x", "--audio-format", "m4a",  "--audio-quality", "0"], ext: "mp4",  mime: "audio/mp4"  },
-  wav:  { args: ["-x", "--audio-format", "wav"],                          ext: "wav",  mime: "audio/wav"  },
-  flac: { args: ["-x", "--audio-format", "flac"],                         ext: "flac", mime: "audio/flac" },
+  mp3:  { audioFormat: "mp3",  ext: "mp3",  mime: "audio/mpeg", lossless: false, canEmbed: true  },
+  m4a:  { audioFormat: "m4a",  ext: "m4a",  mime: "audio/mp4",  lossless: false, canEmbed: true  },
+  mp4:  { audioFormat: "m4a",  ext: "mp4",  mime: "audio/mp4",  lossless: false, canEmbed: true  },
+  wav:  { audioFormat: "wav",  ext: "wav",  mime: "audio/wav",  lossless: true,  canEmbed: false },
+  flac: { audioFormat: "flac", ext: "flac", mime: "audio/flac", lossless: true,  canEmbed: true  },
 };
+
+// Clamp a requested MP3 bitrate to a sane CBR value; "" means "let yt-dlp pick best".
+function normalizeBitrate(raw) {
+  const n = parseInt(String(raw || ""), 10);
+  if (!Number.isFinite(n)) return "";
+  if (n < 64) return "64";
+  if (n > 320) return "320";
+  return String(n);
+}
+
+// Build the yt-dlp argument list for a format + plan-derived options.
+// - bitrate: lossy formats encode CBR at "<bitrate>K"; lossless ignore it.
+// - meta: embed title/artist/etc. tags and cover art (where the container supports it).
+function buildYtdlpArgs(fmt, opts) {
+  const args = ["-x", "--audio-format", fmt.audioFormat];
+
+  if (!fmt.lossless) {
+    // "<n>K" tells ffmpeg to target that exact bitrate; "0" = best VBR.
+    args.push("--audio-quality", opts.bitrate ? `${opts.bitrate}K` : "0");
+  }
+
+  if (opts.meta && fmt.canEmbed) {
+    // --convert-thumbnails jpg keeps cover-art embedding reliable (MP3 rejects webp).
+    args.push("--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg");
+  }
+
+  return args;
+}
+
+// ── Priority-aware job queue ────────────────────────────────────────────────
+// Bounds concurrent yt-dlp/ffmpeg jobs so the box stays responsive, and lets
+// Pro ("priority") downloads jump ahead of the free queue — the server side of
+// "priority server queue / faster processing". Tune with MAX_CONCURRENT env.
+const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT || "3", 10) || 3);
+let activeJobs = 0;
+const jobQueue = []; // { priority: 0|1, run: (release) => void }
+
+function pumpQueue() {
+  while (activeJobs < MAX_CONCURRENT && jobQueue.length) {
+    const job = jobQueue.shift();
+    activeJobs++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activeJobs--;
+      pumpQueue();
+    };
+    try {
+      job.run(release);
+    } catch (e) {
+      console.error("job run error:", e);
+      release();
+    }
+  }
+}
+
+function scheduleJob(priority, run) {
+  const job = { priority: priority ? 1 : 0, run };
+  if (job.priority) {
+    // Insert ahead of all normal jobs, behind any waiting priority jobs (FIFO within a tier).
+    let i = 0;
+    while (i < jobQueue.length && jobQueue[i].priority >= job.priority) i++;
+    jobQueue.splice(i, 0, job);
+  } else {
+    jobQueue.push(job);
+  }
+  pumpQueue();
+}
 
 // Download in the requested audio format.
 // yt-dlp's format conversion is a post-processor that needs a real file to work
@@ -136,6 +207,13 @@ app.get("/download", (req, res) => {
   const title = req.query.title || "track";
   const requested = String(req.query.format || "mp3").toLowerCase();
   const fmt = DOWNLOAD_FORMATS[requested] || DOWNLOAD_FORMATS.mp3;
+
+  // Plan-derived options passed by the WP plugin's signed URL.
+  const opts = {
+    bitrate: normalizeBitrate(req.query.bitrate),
+    meta: String(req.query.meta || "") === "1",
+  };
+  const priority = String(req.query.priority || "") === "1";
 
   if (!url || !url.includes("soundcloud.com")) {
     return res.status(400).json({ error: "Invalid SoundCloud URL" });
@@ -157,60 +235,83 @@ app.get("/download", (req, res) => {
     } catch (e) {}
   }
 
-  const ytdlp = spawn("yt-dlp", [
-    ...fmt.args,
-    "-o", outTemplate,
-    "--no-playlist",
-    "--no-progress",
-    url,
-  ]);
-
-  let stderr = "";
-  ytdlp.stderr.on("data", (d) => {
-    stderr += d.toString();
-  });
-
-  ytdlp.on("error", (err) => {
-    console.error("spawn error:", err);
-    cleanup();
-    if (!res.headersSent) res.status(500).json({ error: "Download failed" });
-  });
-
-  ytdlp.on("close", (code) => {
-    // Find whatever file yt-dlp actually produced (e.g. mp4 → .m4a).
-    let produced = null;
-    try {
-      const dir = os.tmpdir();
-      const match = fs.readdirSync(dir).find((f) => f.startsWith(prefix + "."));
-      if (match) produced = path.join(dir, match);
-    } catch (e) {}
-
-    if (code !== 0 || !produced) {
-      console.error("yt-dlp failed (code " + code + "):", stderr);
+  scheduleJob(priority, (release) => {
+    // Client already gone before the slot opened — drop the job.
+    if (res.writableEnded || req.destroyed) {
       cleanup();
-      if (!res.headersSent) res.status(500).json({ error: "Conversion failed" });
+      release();
       return;
     }
 
-    res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt.ext}"`);
-    res.setHeader("Content-Type", fmt.mime);
-    try {
-      res.setHeader("Content-Length", fs.statSync(produced).size);
-    } catch (e) {}
+    // Free the queue slot exactly once, whenever this response is fully done.
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      release();
+    };
+    res.on("finish", releaseSlot);
+    res.on("close", releaseSlot);
 
-    const stream = fs.createReadStream(produced);
-    stream.on("error", () => {
-      cleanup();
-      if (!res.headersSent) res.status(500).json({ error: "Read failed" });
+    const ytdlp = spawn("yt-dlp", [
+      ...buildYtdlpArgs(fmt, opts),
+      "-o", outTemplate,
+      "--no-playlist",
+      "--no-progress",
+      url,
+    ]);
+
+    let stderr = "";
+    ytdlp.stderr.on("data", (d) => {
+      stderr += d.toString();
     });
-    stream.on("close", cleanup);
-    stream.pipe(res);
-  });
 
-  // Client aborted before we finished — stop yt-dlp and clean up.
-  req.on("close", () => {
-    if (ytdlp.exitCode === null) ytdlp.kill();
-    cleanup();
+    ytdlp.on("error", (err) => {
+      console.error("spawn error:", err);
+      cleanup();
+      if (!res.headersSent) res.status(500).json({ error: "Download failed" });
+      releaseSlot();
+    });
+
+    ytdlp.on("close", (code) => {
+      // Find whatever file yt-dlp actually produced (e.g. mp4 → .m4a).
+      let produced = null;
+      try {
+        const dir = os.tmpdir();
+        const match = fs.readdirSync(dir).find((f) => f.startsWith(prefix + "."));
+        if (match) produced = path.join(dir, match);
+      } catch (e) {}
+
+      if (code !== 0 || !produced) {
+        console.error("yt-dlp failed (code " + code + "):", stderr);
+        cleanup();
+        if (!res.headersSent) res.status(500).json({ error: "Conversion failed" });
+        releaseSlot();
+        return;
+      }
+
+      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt.ext}"`);
+      res.setHeader("Content-Type", fmt.mime);
+      try {
+        res.setHeader("Content-Length", fs.statSync(produced).size);
+      } catch (e) {}
+
+      const stream = fs.createReadStream(produced);
+      stream.on("error", () => {
+        cleanup();
+        if (!res.headersSent) res.status(500).json({ error: "Read failed" });
+        releaseSlot();
+      });
+      stream.on("close", cleanup);
+      stream.pipe(res);
+    });
+
+    // Client aborted before we finished — stop yt-dlp and clean up.
+    req.on("close", () => {
+      if (ytdlp.exitCode === null) ytdlp.kill();
+      cleanup();
+      releaseSlot();
+    });
   });
 });
 
