@@ -150,8 +150,14 @@ function buildYtdlpArgs(fmt, opts) {
   }
 
   if (opts.meta && fmt.canEmbed) {
-    // --convert-thumbnails jpg keeps cover-art embedding reliable (MP3 rejects webp).
-    args.push("--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg");
+    // Tags (ID3/MP4/Vorbis comments) are reliable on every container we allow.
+    args.push("--embed-metadata");
+    // Cover-art embedding is only reliable for the lossy containers. Embedding a
+    // picture into FLAC via ffmpeg can fail the whole job, so skip the thumbnail
+    // there (tags still applied). --convert-thumbnails jpg avoids webp rejection.
+    if (!fmt.lossless) {
+      args.push("--embed-thumbnail", "--convert-thumbnails", "jpg");
+    }
   }
 
   return args;
@@ -274,20 +280,31 @@ app.get("/download", (req, res) => {
     });
 
     ytdlp.on("close", (code) => {
-      // Find whatever file yt-dlp actually produced (e.g. mp4 → .m4a).
+      // Find the finished audio yt-dlp produced. Prefer the exact target extension
+      // (mp4 resolves to .m4a), and never pick an in-progress ".part" fragment.
       let produced = null;
       try {
         const dir = os.tmpdir();
-        const match = fs.readdirSync(dir).find((f) => f.startsWith(prefix + "."));
-        if (match) produced = path.join(dir, match);
+        const files = fs.readdirSync(dir).filter((f) => f.startsWith(prefix + "."));
+        const exact = files.find((f) => f === prefix + "." + fmt.ext);
+        const pick = exact || files.find((f) => !f.endsWith(".part"));
+        if (pick) produced = path.join(dir, pick);
       } catch (e) {}
 
-      if (code !== 0 || !produced) {
-        console.error("yt-dlp failed (code " + code + "):", stderr);
+      // No finished audio at all → genuine conversion failure.
+      if (!produced) {
+        console.error("yt-dlp failed (code " + code + "), no output:", stderr);
         cleanup();
         if (!res.headersSent) res.status(500).json({ error: "Conversion failed" });
         releaseSlot();
         return;
+      }
+
+      // Non-zero exit but the finished file exists → a post-processing step (e.g.
+      // cover-art embed) failed after the audio was ready. Serve the audio anyway
+      // rather than denying the download over a cosmetic tagging error.
+      if (code !== 0) {
+        console.warn("yt-dlp exited " + code + " but output exists; serving anyway. stderr:", stderr);
       }
 
       res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${fmt.ext}"`);
