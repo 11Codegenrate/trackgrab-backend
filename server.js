@@ -10,6 +10,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Audio conversion routes (/probe, /convert) used by the SCloud Audio Converter.
+app.use(require("./convert"));
+
 // Health check — keeps the process reachable (ping this to verify it's up).
 app.get("/", (req, res) => {
   res.json({ status: "TrackGrab server is running ✅" });
