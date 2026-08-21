@@ -13,6 +13,34 @@ app.use(express.json());
 // Audio conversion routes (/probe, /convert) used by the SCloud Audio Converter.
 app.use(require("./convert"));
 
+// ── API auth (opt-in) ───────────────────────────────────────────────────────
+// Set API_SECRET to the same value as the WordPress "Shared API secret" to lock
+// down the API: /info requires the X-API-Key header, and /download requires a
+// valid, unexpired HMAC signature. Leave API_SECRET unset to keep the old open
+// behaviour (nothing breaks until you deliberately enable it on both sides).
+const API_SECRET = process.env.API_SECRET || "";
+
+function apiKeyOk(req) {
+  if (!API_SECRET) return true;
+  return (req.get("x-api-key") || "") === API_SECRET;
+}
+
+// Verify the WordPress download-link signature. Payload mirrors the plugin:
+// url\nformat\ntitle\nexp, then \nbitrate and \nmeta only when those are present
+// (priority is intentionally not signed). Rejects expired links.
+function downloadSigOk(q) {
+  if (!API_SECRET) return true;
+  const exp = parseInt(q.exp || "0", 10);
+  if (!exp || Date.now() / 1000 > exp) return false;
+  let payload = (q.url || "") + "\n" + (q.format || "") + "\n" + (q.title || "") + "\n" + String(q.exp);
+  if (q.bitrate) payload += "\n" + q.bitrate;
+  if (q.meta) payload += "\n" + q.meta;
+  const expected = crypto.createHmac("sha256", API_SECRET).update(payload).digest("hex");
+  const a = Buffer.from(String(q.sig || ""));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 // Health check — keeps the process reachable (ping this to verify it's up).
 app.get("/", (req, res) => {
   res.json({ status: "TrackGrab server is running ✅" });
@@ -63,6 +91,9 @@ function flatTrackShape(e) {
 // to SoundCloud) instead of resolving all 50 tracks (which gets rate-limited).
 // A single-track URL returns its full metadata (flat-playlist is a no-op there).
 app.get("/info", (req, res) => {
+  if (!apiKeyOk(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   const url = req.query.url;
   if (!url || !url.includes("soundcloud.com")) {
     return res.status(400).json({ error: "Invalid SoundCloud URL" });
@@ -224,6 +255,9 @@ app.get("/download", (req, res) => {
   };
   const priority = String(req.query.priority || "") === "1";
 
+  if (!downloadSigOk(req.query)) {
+    return res.status(403).json({ error: "Invalid or expired download link" });
+  }
   if (!url || !url.includes("soundcloud.com")) {
     return res.status(400).json({ error: "Invalid SoundCloud URL" });
   }
