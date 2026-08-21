@@ -70,10 +70,14 @@ router.post("/probe", upload.single("file"), (req, res) => {
   if (!validSig(`probe|${exp}`, exp, sig)) return fail(403, "bad_signature");
 
   const pf = spawn(FFPROBE, ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", input]);
-  let out = "";
+  let out = "", errout = "";
   pf.stdout.on("data", (d) => (out += d.toString()));
-  pf.on("error", () => fail(500, "ffprobe_failed"));
-  pf.on("close", () => {
+  pf.stderr.on("data", (d) => (errout += d.toString()));
+  pf.on("error", (e) => {
+    console.error("[probe] ffprobe could not start:", e.code || e.message, "(is ffprobe on PATH?)");
+    fail(500, "ffprobe_failed");
+  });
+  pf.on("close", (code) => {
     unlink(input);
     let data = {};
     try { data = JSON.parse(out); } catch (e) {}
@@ -82,6 +86,9 @@ router.post("/probe", upload.single("file"), (req, res) => {
     let source = "";
     for (const f of ["mp3", "wav", "flac", "m4a"]) {
       if (fmt.includes(f) || (f === "m4a" && fmt.includes("mov"))) { source = f; break; }
+    }
+    if (!source || duration <= 0) {
+      console.warn(`[probe] unreadable: code=${code} fmt="${fmt}" dur=${duration} stderr=${errout.slice(-300)}`);
     }
     if (!res.headersSent) res.json({ source, duration });
   });
