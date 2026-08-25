@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: trackgrab-backend
+    env: node
+    buildCommand: bash build.sh
+    # Prepend ./bin so yt-dlp (and the ffmpeg it shells out to) are found on PATH.
+    startCommand: PATH="$PWD/bin:$PATH" node server.js
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Point the app at the binaries build.sh installs into ./bin.
+      - key: YTDLP_PATH
+        value: ./bin/yt-dlp
+      - key: FFMPEG_LOCATION
+        value: ./bin
+      - key: FFMPEG_PATH
+        value: ./bin/ffmpeg
+      - key: FFPROBE_PATH
+        value: ./bin/ffprobe
+      # yt-dlp cache on writable tmp (reused across download jobs for speed).
+      - key: YTDLP_CACHE_DIR
+        value: /tmp/yt-dlp-cache
