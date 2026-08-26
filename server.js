@@ -7,7 +7,15 @@ const fs = require("fs");
 const crypto = require("crypto");
 const app = express();
 
-app.use(cors());
+// Expose the download headers to cross-origin browser JS. The WordPress tool page
+// and this API are different origins, so without this the in-page downloader can't
+// read the server's real filename or size — which is what lets iOS/Android save the
+// file under the correct name and extension instead of a generic "download".
+app.use(
+  cors({
+    exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges"],
+  })
+);
 app.use(express.json());
 
 // Audio conversion routes (/probe, /convert) used by the SCloud Audio Converter.
