@@ -225,6 +225,90 @@ function buildYtdlpArgs(fmt, opts) {
   return args;
 }
 
+// Turn a failed yt-dlp/ffmpeg run into a specific, actionable reason. The full
+// stderr is logged server-side; this is the short, safe version the browser shows,
+// so a failed download stops being a mystery "Something went wrong".
+function classifyDownloadError(stderr) {
+  const s = String(stderr || "");
+  const low = s.toLowerCase();
+  const lines = s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const detail = lines.length ? lines[lines.length - 1].slice(0, 300) : "";
+  const has = (re) => re.test(low);
+
+  if (
+    has(/ffmpeg (is )?not (installed|found)/) || has(/ffprobe/) || has(/postprocessing/) ||
+    has(/you have requested.*but ffmpeg/) || has(/preferred audio format/) || has(/ffmpeg-location/)
+  ) {
+    return {
+      category: "ffmpeg",
+      message: "The server's audio converter (ffmpeg) is missing or failed.",
+      hint: "Install ffmpeg + ffprobe on the server and make sure they're on the PATH the app runs with (or set FFMPEG_LOCATION). Every download needs ffmpeg — that's why all formats fail.",
+      detail,
+    };
+  }
+  if (has(/\bgo\+\b/) || has(/premium/) || has(/snippet/) || has(/preview/) || has(/purchase|subscri/)) {
+    return {
+      category: "unavailable",
+      message: "This track can't be downloaded (looks like SoundCloud Go+ / preview-only).",
+      hint: "Only fully public, free-to-stream tracks can be downloaded. Try another track.",
+      detail,
+    };
+  }
+  if (has(/private/) || has(/\b403\b/) || has(/forbidden/) || has(/unauthoriz/) || has(/\bsign in\b|\blog ?in\b/)) {
+    return {
+      category: "private",
+      message: "This track is private or blocked, so it can't be downloaded.",
+      hint: "Make sure the track is public. Private or blocked tracks can't be fetched.",
+      detail,
+    };
+  }
+  if (has(/not available in your country|geo-?block|region/)) {
+    return {
+      category: "geo",
+      message: "This track is region-blocked from the server's location.",
+      hint: "It isn't available where the server is hosted.",
+      detail,
+    };
+  }
+  if (has(/http error 429|too many requests|rate.?limit/)) {
+    return {
+      category: "ratelimit",
+      message: "SoundCloud is rate-limiting the server right now.",
+      hint: "Wait a minute and try again; if it's constant, lower MAX_CONCURRENT.",
+      detail,
+    };
+  }
+  if (
+    has(/unable to extract/) || has(/unable to download (webpage|json)/) || has(/unsupported url/) ||
+    has(/nonetype/) || has(/no video formats|no audio/) || has(/failed to parse json|unable to parse/)
+  ) {
+    return {
+      category: "extractor",
+      message: "The downloader couldn't read this track — it's probably out of date.",
+      hint: "SoundCloud changes its API often. Update yt-dlp on the server (yt-dlp -U or pip install -U yt-dlp), then restart the app and try again.",
+      detail,
+    };
+  }
+  return {
+    category: "unknown",
+    message: "The server couldn't produce this file.",
+    hint: "Check the server logs (pm2 logs trackgrab) for the yt-dlp / ffmpeg error. Most often it's an out-of-date yt-dlp (yt-dlp -U) or a missing ffmpeg.",
+    detail,
+  };
+}
+
+// Run "<tool> <versionArgs>" and report whether it's actually runnable. Used by
+// the startup self-check and /diag so a missing yt-dlp/ffmpeg is obvious.
+function toolVersion(cmd, args, cb) {
+  execFile(cmd, args, { timeout: 8000 }, (err, stdout, stderr) => {
+    if (err) return cb({ ok: false, error: (err && err.code) || String(err.message || err).slice(0, 140) });
+    cb({ ok: true, version: String(stdout || stderr).split(/\r?\n/)[0].slice(0, 140) });
+  });
+}
+function ffmpegProbePath() {
+  return FFMPEG_LOCATION ? path.join(FFMPEG_LOCATION, "ffmpeg") : (process.env.FFMPEG_PATH || "ffmpeg");
+}
+
 // ── Priority-aware job queue ────────────────────────────────────────────────
 // Bounds concurrent yt-dlp/ffmpeg jobs so the box stays responsive, and lets
 // Pro ("priority") downloads jump ahead of the free queue — the server side of
@@ -360,7 +444,23 @@ app.get("/download", (req, res) => {
     ytdlp.on("error", (err) => {
       console.error("spawn error:", err);
       cleanup();
-      if (!res.headersSent) res.status(500).json({ error: "Download failed" });
+      if (!res.headersSent) {
+        if (err && err.code === "ENOENT") {
+          res.status(500).json({
+            error: "Download failed",
+            category: "ytdlp-missing",
+            message: "The downloader (yt-dlp) isn't installed or isn't on the server's PATH.",
+            hint: "Install yt-dlp on the server (or set YTDLP_PATH to its full path) and restart the app.",
+          });
+        } else {
+          res.status(500).json({
+            error: "Download failed",
+            category: "spawn",
+            message: "The server couldn't start the download process.",
+            hint: "Check the server logs (pm2 logs trackgrab).",
+          });
+        }
+      }
       releaseSlot();
     });
 
@@ -388,11 +488,22 @@ app.get("/download", (req, res) => {
         if (pick) produced = path.join(dir, pick);
       } catch (e) {}
 
-      // No finished audio at all → genuine conversion failure.
+      // No finished audio at all → genuine conversion failure. Classify the reason
+      // so the browser can show what actually went wrong (ffmpeg missing, stale
+      // yt-dlp, private/Go+ track, …) instead of a blank "Something went wrong".
       if (!produced) {
-        console.error("yt-dlp failed (code " + code + "), no output:", stderr);
+        console.error("yt-dlp failed (code " + code + "), no output. stderr:\n" + stderr);
+        const info = classifyDownloadError(stderr);
         cleanup();
-        if (!res.headersSent) res.status(500).json({ error: "Conversion failed" });
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "Conversion failed",
+            category: info.category,
+            message: info.message,
+            hint: info.hint,
+            detail: info.detail,
+          });
+        }
         releaseSlot();
         return;
       }
@@ -431,5 +542,28 @@ app.get("/download", (req, res) => {
   });
 });
 
+// Tool health — visit https://<your-api>/diag in a browser to confirm yt-dlp and
+// ffmpeg are actually runnable by the app. If ffmpeg.ok is false, EVERY download
+// will 500 (all formats need ffmpeg); if yt-dlp.ok is false, nothing downloads.
+app.get("/diag", (req, res) => {
+  const out = { ytdlp: null, ffmpeg: null, ffmpegPath: ffmpegProbePath(), ytdlpPath: YTDLP_BIN };
+  let pending = 2;
+  const done = () => { if (--pending === 0) res.json(out); };
+  toolVersion(YTDLP_BIN, ["--version"], (r) => { out.ytdlp = r; done(); });
+  toolVersion(ffmpegProbePath(), ["-version"], (r) => { out.ffmpeg = r; done(); });
+});
+
+// Log tool availability at boot so a missing yt-dlp/ffmpeg is obvious in pm2 logs.
+function selfCheck() {
+  toolVersion(YTDLP_BIN, ["--version"], (r) =>
+    console.log(r.ok ? `✓ yt-dlp ${r.version}` : `✗ yt-dlp NOT RUNNABLE (${r.error}) — install it or set YTDLP_PATH; downloads will fail`));
+  const ff = ffmpegProbePath();
+  toolVersion(ff, ["-version"], (r) =>
+    console.log(r.ok ? `✓ ${r.version}` : `✗ ffmpeg NOT RUNNABLE at "${ff}" (${r.error}) — install ffmpeg/ffprobe or set FFMPEG_LOCATION; ALL downloads will 500`));
+}
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`TrackGrab server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`TrackGrab server running on port ${PORT}`);
+  selfCheck();
+});
