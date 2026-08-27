@@ -1,16 +1,17 @@
 {
   "name": "trackgrab-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "TrackGrab SoundCloud downloader backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "monitor": "node monitor.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^2.2.0"
   },
   "engines": {
     "node": ">=18.0.0"

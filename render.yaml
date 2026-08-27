@@ -21,3 +21,16 @@ services:
       # yt-dlp cache on writable tmp (reused across download jobs for speed).
       - key: YTDLP_CACHE_DIR
         value: /tmp/yt-dlp-cache
+      # Keep the combined downloader + converter load safe on a small instance.
+      - key: MAX_CONCURRENT
+        value: "2"
+      - key: MAX_QUEUE
+        value: "30"
+      - key: DOWNLOAD_TIMEOUT_S
+        value: "900"
+      - key: CONVERT_CONCURRENCY
+        value: "1"
+      - key: CONVERT_TIMEOUT_S
+        value: "600"
+      - key: M4A_BITRATE
+        value: "128"

@@ -46,8 +46,8 @@ else
 fi
 rm -rf "$TMP_FF"
 
-echo "==> Installing npm dependencies"
-npm install --omit=dev
+echo "==> Installing locked npm dependencies"
+npm ci --omit=dev
 
 echo "==> Build complete. Tools installed in: $BIN_DIR"
 ls -la "$BIN_DIR" || true

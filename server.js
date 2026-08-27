@@ -19,14 +19,17 @@ app.use(
 app.use(express.json());
 
 // Audio conversion routes (/probe, /convert) used by the SCloud Audio Converter.
-app.use(require("./convert"));
+const convertRouter = require("./convert");
+app.use(convertRouter);
 
 // ── API auth (opt-in) ───────────────────────────────────────────────────────
 // Set API_SECRET to the same value as the WordPress "Shared API secret" to lock
 // down the API: /info requires the X-API-Key header, and /download requires a
 // valid, unexpired HMAC signature. Leave API_SECRET unset to keep the old open
 // behaviour (nothing breaks until you deliberately enable it on both sides).
-const API_SECRET = process.env.API_SECRET || "";
+// SCLOUD_API_SECRET is the name used by the WordPress plugin/readme. Keep the
+// older API_SECRET alias so an existing VPS is not broken during deployment.
+const API_SECRET = process.env.SCLOUD_API_SECRET || process.env.API_SECRET || "";
 
 function apiKeyOk(req) {
   if (!API_SECRET) return true;
@@ -51,7 +54,12 @@ function downloadSigOk(q) {
 
 // Health check — keeps the process reachable (ping this to verify it's up).
 app.get("/", (req, res) => {
-  res.json({ status: "TrackGrab server is running ✅" });
+  res.json({
+    status: "TrackGrab server is running ✅",
+    uptimeSeconds: Math.floor(process.uptime()),
+    downloads: { active: activeJobs, queued: jobQueue.length },
+    converter: convertRouter.getStatus(),
+  });
 });
 
 // Largest usable thumbnail URL from a yt-dlp info object.
@@ -179,8 +187,6 @@ const DOWNLOAD_FORMATS = {
 
 // Real audio extensions the /download picker is allowed to serve. Used to make
 // sure we never hand back an embedded cover-art image (.jpg/.webp) as the track.
-const AUDIO_EXTS = new Set(["mp3", "m4a", "mp4", "wav", "flac", "aac", "opus", "ogg", "webm"]);
-
 // Configurable binary locations. Defaults keep the old behaviour (bare names on
 // PATH) so existing VPS installs are unaffected; a Render/container build can set
 // YTDLP_PATH / FFMPEG_LOCATION to point at ./bin without code changes.
@@ -308,12 +314,51 @@ function toolVersion(cmd, args, cb) {
 function ffmpegProbePath() {
   return FFMPEG_LOCATION ? path.join(FFMPEG_LOCATION, "ffmpeg") : (process.env.FFMPEG_PATH || "ffmpeg");
 }
+function ffprobeProbePath() {
+  return FFMPEG_LOCATION ? path.join(FFMPEG_LOCATION, "ffprobe") : (process.env.FFPROBE_PATH || "ffprobe");
+}
+
+// Verify that yt-dlp's finished file really is the requested container/codec.
+// This prevents a leftover source stream from being served under a false .wav,
+// .flac or .mp4 extension when post-processing fails part-way through.
+function verifyDownloadedOutput(input, requested) {
+  return new Promise((resolve) => {
+    const pf = spawn(ffprobeProbePath(), [
+      "-v", "error",
+      "-show_entries", "format=format_name:stream=codec_name,codec_type",
+      "-of", "json",
+      input,
+    ]);
+    let out = "";
+    pf.stdout.on("data", (d) => { out += d.toString(); if (out.length > 20000) out = out.slice(-20000); });
+    pf.on("error", (e) => resolve({ ok: false, detail: e.code || e.message || "ffprobe_failed" }));
+    pf.on("close", () => {
+      try {
+        const data = JSON.parse(out);
+        const container = String(data?.format?.format_name || "").toLowerCase();
+        const codecs = (Array.isArray(data?.streams) ? data.streams : [])
+          .filter((s) => s?.codec_type === "audio")
+          .map((s) => String(s.codec_name || "").toLowerCase());
+        const ok =
+          (requested === "mp3" && container.includes("mp3") && codecs.includes("mp3")) ||
+          ((requested === "m4a" || requested === "mp4") && /mov|mp4|m4a/.test(container) && codecs.includes("aac")) ||
+          (requested === "wav" && container.includes("wav") && codecs.some((c) => c.startsWith("pcm_"))) ||
+          (requested === "flac" && container.includes("flac") && codecs.includes("flac"));
+        resolve({ ok, detail: `container=${container || "?"}; codecs=${codecs.join(",") || "?"}` });
+      } catch (e) {
+        resolve({ ok: false, detail: "invalid_ffprobe_output" });
+      }
+    });
+  });
+}
 
 // ── Priority-aware job queue ────────────────────────────────────────────────
 // Bounds concurrent yt-dlp/ffmpeg jobs so the box stays responsive, and lets
 // Pro ("priority") downloads jump ahead of the free queue — the server side of
 // "priority server queue / faster processing". Tune with MAX_CONCURRENT env.
-const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT || "3", 10) || 3);
+const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT || "2", 10) || 2);
+const MAX_QUEUE = Math.max(1, parseInt(process.env.MAX_QUEUE || "30", 10) || 30);
+const DOWNLOAD_TIMEOUT_S = Math.max(60, parseInt(process.env.DOWNLOAD_TIMEOUT_S || "900", 10) || 900);
 // Parallel HLS fragment downloads per yt-dlp job. 4 is a good default; raise via
 // YTDLP_FRAGMENTS on a beefier box, but keep it modest so N jobs × N fragments
 // don't saturate the network.
@@ -342,6 +387,7 @@ function pumpQueue() {
 }
 
 function scheduleJob(priority, run) {
+  if (activeJobs >= MAX_CONCURRENT && jobQueue.length >= MAX_QUEUE) return false;
   const job = { priority: priority ? 1 : 0, run };
   if (job.priority) {
     // Insert ahead of all normal jobs, behind any waiting priority jobs (FIFO within a tier).
@@ -352,6 +398,7 @@ function scheduleJob(priority, run) {
     jobQueue.push(job);
   }
   pumpQueue();
+  return true;
 }
 
 // Download in the requested audio format.
@@ -362,7 +409,11 @@ app.get("/download", (req, res) => {
   const url = req.query.url;
   const title = req.query.title || "track";
   const requested = String(req.query.format || "mp3").toLowerCase();
-  const fmt = DOWNLOAD_FORMATS[requested] || DOWNLOAD_FORMATS.mp3;
+  const fmt = DOWNLOAD_FORMATS[requested];
+
+  if (!fmt) {
+    return res.status(400).json({ error: "Unsupported output format" });
+  }
 
   // Plan-derived options passed by the WP plugin's signed URL.
   const opts = {
@@ -394,7 +445,7 @@ app.get("/download", (req, res) => {
     } catch (e) {}
   }
 
-  scheduleJob(priority, (release) => {
+  const accepted = scheduleJob(priority, (release) => {
     // Client already gone before the slot opened — drop the job.
     if (res.writableEnded || req.destroyed) {
       cleanup();
@@ -437,11 +488,18 @@ app.get("/download", (req, res) => {
     ]);
 
     let stderr = "";
+    let timedOut = false;
     ytdlp.stderr.on("data", (d) => {
       stderr += d.toString();
+      if (stderr.length > 65536) stderr = stderr.slice(-65536);
     });
+    const jobTimer = setTimeout(() => {
+      timedOut = true;
+      if (ytdlp.exitCode === null) ytdlp.kill("SIGKILL");
+    }, DOWNLOAD_TIMEOUT_S * 1000);
 
     ytdlp.on("error", (err) => {
+      clearTimeout(jobTimer);
       console.error("spawn error:", err);
       cleanup();
       if (!res.headersSent) {
@@ -464,15 +522,16 @@ app.get("/download", (req, res) => {
       releaseSlot();
     });
 
-    ytdlp.on("close", (code) => {
+    ytdlp.on("close", async (code) => {
+      clearTimeout(jobTimer);
       // Find the finished AUDIO yt-dlp produced. This must never pick the embedded
       // cover-art image (yt-dlp leaves a prefix.jpg/.webp beside the audio when
       // --embed-thumbnail is used) or an in-progress ".part" fragment. The old code
       // fell back to "first non-.part file", which for the mp4 format — whose target
       // extension (.mp4) differs from the encoder's real output (.m4a) — could hand
       // back the .jpg thumbnail and serve an image as the track. Pick by real audio
-      // extension only: exact requested ext, then the encoder ext, then any known
-      // audio ext; images are never eligible.
+      // extension only: exact requested ext, then the encoder ext. Never fall back
+      // to an arbitrary source stream, because that would create a false extension.
       let produced = null;
       try {
         const dir = os.tmpdir();
@@ -483,10 +542,24 @@ app.get("/download", (req, res) => {
           .filter((f) => f.startsWith(base) && !f.endsWith(".part"));
         const pick =
           files.find((f) => extOf(f) === fmt.ext) ||         // requested ext (mp3/m4a/wav/flac)
-          files.find((f) => extOf(f) === fmt.audioFormat) || // encoder ext (mp4 -> m4a)
-          files.find((f) => AUDIO_EXTS.has(extOf(f)));       // any real audio, never an image
+          files.find((f) => extOf(f) === fmt.audioFormat);   // encoder ext (mp4 -> m4a)
         if (pick) produced = path.join(dir, pick);
       } catch (e) {}
+
+      if (timedOut) {
+        console.error(`yt-dlp timed out after ${DOWNLOAD_TIMEOUT_S}s for ${url}`);
+        cleanup();
+        if (!res.headersSent) {
+          res.status(504).json({
+            error: "Download timed out",
+            category: "timeout",
+            message: "The server took too long to build this file.",
+            hint: "Try again once. If this repeats, lower concurrency or inspect the VPS network and SoundCloud rate limits.",
+          });
+        }
+        releaseSlot();
+        return;
+      }
 
       // No finished audio at all → genuine conversion failure. Classify the reason
       // so the browser can show what actually went wrong (ffmpeg missing, stale
@@ -515,6 +588,22 @@ app.get("/download", (req, res) => {
         console.warn("yt-dlp exited " + code + " but output exists; serving anyway. stderr:", stderr);
       }
 
+      const verified = await verifyDownloadedOutput(produced, requested);
+      if (!verified.ok) {
+        console.error(`yt-dlp produced the wrong format for ${requested}: ${verified.detail}`);
+        cleanup();
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "Wrong output format",
+            category: "wrong-output-format",
+            message: `The server could not produce a valid ${requested.toUpperCase()} file.`,
+            hint: "Check yt-dlp/FFmpeg versions and the VPS logs. The incorrect file was rejected instead of being sent with a false extension.",
+          });
+        }
+        releaseSlot();
+        return;
+      }
+
       const safeFile = `${safeTitle}.${fmt.ext}`;
       res.setHeader("Content-Disposition", `attachment; filename="${safeFile}"; filename*=UTF-8''${encodeURIComponent(safeFile)}`);
       res.setHeader("Content-Type", fmt.mime);
@@ -533,20 +622,44 @@ app.get("/download", (req, res) => {
       stream.pipe(res);
     });
 
-    // Client aborted before we finished — stop yt-dlp and clean up.
-    req.on("close", () => {
+    // "close" on IncomingMessage can mean the request body merely completed, so
+    // using it here could kill healthy GET downloads. Only "aborted" means the
+    // request itself was interrupted; response close handles a vanished client.
+    req.on("aborted", () => {
       if (ytdlp.exitCode === null) ytdlp.kill();
       cleanup();
       releaseSlot();
     });
+    res.on("close", () => {
+      if (!res.writableEnded && ytdlp.exitCode === null) ytdlp.kill();
+      if (!res.writableEnded) cleanup();
+    });
   });
+  if (!accepted) {
+    return res.status(503).json({
+      error: "Server busy",
+      category: "queue-full",
+      message: "The download queue is full right now.",
+      hint: "Please wait a moment and try again.",
+    });
+  }
 });
 
 // Tool health — visit https://<your-api>/diag in a browser to confirm yt-dlp and
 // ffmpeg are actually runnable by the app. If ffmpeg.ok is false, EVERY download
 // will 500 (all formats need ffmpeg); if yt-dlp.ok is false, nothing downloads.
 app.get("/diag", (req, res) => {
-  const out = { ytdlp: null, ffmpeg: null, ffmpegPath: ffmpegProbePath(), ytdlpPath: YTDLP_BIN };
+  const out = {
+    ytdlp: null,
+    ffmpeg: null,
+    ffmpegPath: ffmpegProbePath(),
+    ffprobePath: ffprobeProbePath(),
+    ytdlpPath: YTDLP_BIN,
+    uptimeSeconds: Math.floor(process.uptime()),
+    downloads: { active: activeJobs, queued: jobQueue.length, concurrency: MAX_CONCURRENT, queueLimit: MAX_QUEUE },
+    converter: convertRouter.getStatus(),
+    memory: process.memoryUsage(),
+  };
   let pending = 2;
   const done = () => { if (--pending === 0) res.json(out); };
   toolVersion(YTDLP_BIN, ["--version"], (r) => { out.ytdlp = r; done(); });
@@ -563,7 +676,20 @@ function selfCheck() {
 }
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`TrackGrab server running on port ${PORT}`);
   selfCheck();
 });
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; draining active requests before exit`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 12000).unref();
+}
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
