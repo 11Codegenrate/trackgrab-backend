@@ -22,34 +22,64 @@ app.use(express.json());
 const convertRouter = require("./convert");
 app.use(convertRouter);
 
-// ── API auth (opt-in) ───────────────────────────────────────────────────────
-// Set API_SECRET to the same value as the WordPress "Shared API secret" to lock
-// down the API: /info requires the X-API-Key header, and /download requires a
-// valid, unexpired HMAC signature. Leave API_SECRET unset to keep the old open
-// behaviour (nothing breaks until you deliberately enable it on both sides).
-// SCLOUD_API_SECRET is the name used by the WordPress plugin/readme. Keep the
-// older API_SECRET alias so an existing VPS is not broken during deployment.
-const API_SECRET = process.env.SCLOUD_API_SECRET || process.env.API_SECRET || "";
+// ── API auth ────────────────────────────────────────────────────────────────
+// The API_SECRET must equal the WordPress "Shared API secret": /info requires
+// the X-API-Key header, and /download requires a valid, unexpired HMAC signature.
+//
+// RESILIENCE: this used to be empty-by-default, which meant a redeploy that lost
+// the SCLOUD_API_SECRET env var silently flipped the API to "open" — and worse, a
+// mismatch (env lost on one side only) rejected EVERY link with a 403 that reads
+// "Invalid or expired download link". To make that impossible, we now fall back
+// to the SAME baked-in default the WordPress plugin ships with, so the two sides
+// always agree out of the box and survive an env-var loss. Set your own matching
+// secret on BOTH sides for real security. Escape hatch: SCLOUD_API_OPEN=1 forces
+// the old open behaviour (no auth) if you ever need it.
+const SCLOUD_SHARED_DEFAULT_SECRET =
+  "58a6bad22af816266aa838514070d59a2f36a94d426d1f44a1e144d9024db3b7";
+const API_SECRET =
+  process.env.SCLOUD_API_OPEN === "1"
+    ? ""
+    : process.env.SCLOUD_API_SECRET || process.env.API_SECRET || SCLOUD_SHARED_DEFAULT_SECRET;
+
+// Grace window (seconds) that absorbs clock drift between the WordPress box (which
+// stamps `exp`) and this box (which checks it). Without it, a VPS clock a few
+// minutes ahead of WP made every freshly issued link look already-expired. Tune
+// with SIG_LEEWAY_S; 10 minutes is a safe default and does not meaningfully weaken
+// the short-lived link.
+const SIG_LEEWAY_S = Math.max(0, parseInt(process.env.SIG_LEEWAY_S || "600", 10) || 600);
 
 function apiKeyOk(req) {
   if (!API_SECRET) return true;
   return (req.get("x-api-key") || "") === API_SECRET;
 }
 
-// Verify the WordPress download-link signature. Payload mirrors the plugin:
-// url\nformat\ntitle\nexp, then \nbitrate and \nmeta only when those are present
-// (priority is intentionally not signed). Rejects expired links.
-function downloadSigOk(q) {
-  if (!API_SECRET) return true;
+// Verify the WordPress download-link signature. V2 signs every plan-controlled
+// field, including priority. Legacy links remain valid briefly during deployment,
+// but the route never honours priority on a legacy link.
+// Returns { ok } plus a `reason` ("expired" | "badsig" | "missing") so the caller
+// can log WHICH failure happened — the user-facing message stays the same, but the
+// server log finally tells the truth for debugging.
+function downloadSigCheck(q) {
+  if (!API_SECRET) return { ok: true, reason: "" };
   const exp = parseInt(q.exp || "0", 10);
-  if (!exp || Date.now() / 1000 > exp) return false;
+  if (!exp) return { ok: false, reason: "missing" };
+  if (Date.now() / 1000 > exp + SIG_LEEWAY_S) return { ok: false, reason: "expired" };
   let payload = (q.url || "") + "\n" + (q.format || "") + "\n" + (q.title || "") + "\n" + String(q.exp);
-  if (q.bitrate) payload += "\n" + q.bitrate;
-  if (q.meta) payload += "\n" + q.meta;
+  if (String(q.v || "") === "2") {
+    payload += "\n" + (q.bitrate || "") + "\n" + (q.meta || "") + "\n" + (q.priority || "");
+  } else {
+    if (q.bitrate) payload += "\n" + q.bitrate;
+    if (q.meta) payload += "\n" + q.meta;
+  }
   const expected = crypto.createHmac("sha256", API_SECRET).update(payload).digest("hex");
   const a = Buffer.from(String(q.sig || ""));
   const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  return { ok, reason: ok ? "" : "badsig" };
+}
+
+function downloadSigOk(q) {
+  return downloadSigCheck(q).ok;
 }
 
 // Health check — keeps the process reachable (ping this to verify it's up).
@@ -420,10 +450,27 @@ app.get("/download", (req, res) => {
     bitrate: normalizeBitrate(req.query.bitrate),
     meta: String(req.query.meta || "") === "1",
   };
-  const priority = String(req.query.priority || "") === "1";
+  // Only V2 signatures cover this flag. Ignoring it on legacy links closes the
+  // old append-`priority=1` entitlement bypass while allowing a rolling deploy.
+  const priority = String(req.query.v || "") === "2" && String(req.query.priority || "") === "1";
 
-  if (!downloadSigOk(req.query)) {
-    return res.status(403).json({ error: "Invalid or expired download link" });
+  const sigCheck = downloadSigCheck(req.query);
+  if (!sigCheck.ok) {
+    // Same message to the browser (the frontend auto-retries a fresh link on this),
+    // but log the real reason so a genuine misconfig is visible in the server log:
+    //   badsig  → the WordPress "Shared API secret" does not match this box's secret
+    //   expired → clock skew beyond SIG_LEEWAY_S, or a genuinely stale/reused link
+    //   missing → the link was built without a signature (secret unset on WP side)
+    console.warn(
+      `[sig] rejected /download reason=${sigCheck.reason} title=${JSON.stringify(
+        String(req.query.title || "").slice(0, 60)
+      )} exp=${req.query.exp || ""} now=${Math.floor(Date.now() / 1000)}`
+    );
+    // A code lets the frontend tell "refresh the link and retry" apart from a real
+    // problem, without parsing the human message.
+    return res
+      .status(403)
+      .json({ error: "Invalid or expired download link", code: "bad_link", reason: sigCheck.reason });
   }
   if (!url || !url.includes("soundcloud.com")) {
     return res.status(400).json({ error: "Invalid SoundCloud URL" });
