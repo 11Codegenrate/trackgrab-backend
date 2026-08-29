@@ -30,7 +30,20 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const SECRET = process.env.CONVERT_SECRET || "";
+// RESILIENCE (same approach as the downloader's SCLOUD_API_SECRET): default to a
+// shared built-in secret when CONVERT_SECRET is unset, so a redeploy/restart that
+// loses the env var — or an empty "Convert secret" in WordPress — can no longer make
+// every conversion fail with "Your session expired". Set your own matching secret on
+// BOTH sides for real security. CONVERT_OPEN=1 restores the old open behaviour.
+const SHARED_CONVERT_DEFAULT =
+  "9f8e7d6c5b4a39281706f5e4d3c2b1a09182736455647382910abcdef01234567";
+const SECRET =
+  process.env.CONVERT_OPEN === "1"
+    ? ""
+    : process.env.CONVERT_SECRET || SHARED_CONVERT_DEFAULT;
+// Clock-skew grace between the WordPress box (stamps exp) and this box (checks it),
+// so a slightly-off VPS clock does not make fresh tickets look already-expired.
+const SIG_LEEWAY_S = Math.max(0, parseInt(process.env.CONVERT_SIG_LEEWAY_S || "600", 10) || 600);
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 const FFPROBE = process.env.FFPROBE_PATH || "ffprobe";
 const MAX_MB = Math.max(1, parseInt(process.env.CONVERT_MAX_MB || "500", 10) || 500);
@@ -55,12 +68,13 @@ const FORMATS = {
 const router = express.Router();
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: MAX_MB * 1024 * 1024, files: 1 } });
 let active = 0;
+const usedDirectTickets = new Map();
 
 const unlink = (p) => p && fs.promises.unlink(p).catch(() => {});
 
 function validSig(payload, exp, sig) {
   if (!SECRET || !sig || !exp) return false;
-  if (Date.now() / 1000 > Number(exp)) return false;
+  if (Date.now() / 1000 > Number(exp) + SIG_LEEWAY_S) return false;
   const expected = crypto.createHmac("sha256", SECRET).update(payload).digest("hex");
   const a = Buffer.from(String(sig));
   const b = Buffer.from(expected);
@@ -72,17 +86,27 @@ const secretOk = (req) => SECRET && (req.get("x-convert-secret") || "") === SECR
 // proper .mp3/.m4a/.wav/.flac instead of a generic ".bin".
 const DIRECT_MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", flac: "audio/flac" };
 
-// Signature for a browser-issued direct ticket. Mirrors the WordPress payload
-// exactly: direct|<format>|<quality>|<maxmb>|<maxdur>|<exp>. Because the size and
-// duration caps are inside the signed payload, the browser cannot raise them.
-function validDirectSig(format, quality, maxmb, maxdur, exp, sig) {
+// Signature for a browser-issued one-time direct ticket. The random ticket id and
+// every plan cap are signed, so a ticket cannot be replayed or widened.
+function validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig) {
   if (!SECRET || !sig || !exp) return false;
-  if (Date.now() / 1000 > Number(exp)) return false;
-  const payload = `direct|${format}|${quality}|${maxmb}|${maxdur}|${exp}`;
+  if (Date.now() / 1000 > Number(exp) + SIG_LEEWAY_S) return false;
+  if (!/^[a-zA-Z0-9_-]{20,80}$/.test(String(ticket || ""))) return false;
+  const payload = `direct|${format}|${quality}|${maxmb}|${maxdur}|${ticket}|${exp}`;
   const expected = crypto.createHmac("sha256", SECRET).update(payload).digest("hex");
   const a = Buffer.from(String(sig));
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function consumeDirectTicket(ticket, exp) {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [key, expires] of usedDirectTickets) {
+    if (expires < now) usedDirectTickets.delete(key);
+  }
+  if (usedDirectTickets.has(ticket)) return false;
+  usedDirectTickets.set(ticket, Number(exp) || now + 180);
+  return true;
 }
 
 // ffprobe the input duration (seconds); resolves 0 when it can't be read.
@@ -277,10 +301,11 @@ router.post("/convert-direct", upload.single("file"), async (req, res) => {
   const quality = Math.min(320, Math.max(64, parseInt(req.body.quality || "192", 10) || 192));
   const maxmb = parseInt(req.body.maxmb || "0", 10) || 0;
   const maxdur = parseInt(req.body.maxdur || "0", 10) || 0;
+  const ticket = String(req.body.ticket || "");
   const exp = req.body.exp, sig = req.body.sig;
 
   if (!FORMATS[format]) return fail(400, "bad_format");
-  if (!validDirectSig(format, quality, maxmb, maxdur, exp, sig)) return fail(403, "bad_signature");
+  if (!validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig)) return fail(403, "bad_signature");
   if (maxmb > 0 && req.file.size > maxmb * 1024 * 1024) return fail(413, "file_too_large");
   if (active >= MAX_CONCURRENCY) return fail(503, "busy");
 
@@ -290,6 +315,7 @@ router.post("/convert-direct", upload.single("file"), async (req, res) => {
     if (dur <= 0) return fail(400, "unreadable");
     if (dur > maxdur + 1) return fail(413, "too_long");
   }
+	if (!consumeDirectTicket(ticket, exp)) return fail(409, "ticket_used");
 
   convertAndSend(req, res, { input, format, quality, prefix: "scloudd", name: req.body.name || "converted" });
 });
