@@ -6,6 +6,7 @@
 - Every job has a hard timeout, aborted clients stop their child process, error logs are capped, and PM2 restarts the service after a crash or memory spike.
 - The server probes completed output and refuses to send a file when its real container/codec does not match the requested MP3, MP4/M4A, WAV or FLAC format.
 - M4A conversion uses 128 kbps AAC instead of inheriting the MP3 selector's 192 kbps default.
+- Direct converter credits are committed only after FFmpeg creates and verifies the requested output; failed or unreadable uploads are not charged.
 - `/diag`, `/convert-health`, and `npm run monitor` expose the signals needed to distinguish a WordPress/Cloudflare outage from a VPS/FFmpeg outage.
 
 ## Current live abnormality found on 27 August 2026
@@ -63,7 +64,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## Deploy WordPress converter
 
-Upload `scloud-audio-converter-1.5.0.zip`, replace/upgrade the existing plugin, and confirm these existing settings still match the VPS:
+Upload `scloud-audio-converter-1.6.9.zip`, replace/upgrade the existing plugin, and confirm these existing settings still match the VPS. Converter 1.6.9 and backend 1.1.4 must be deployed together because the success-receipt callback is shared by both packages:
 
 - Convert service URL: `https://api.downloadscloudmp3.com`
 - Convert secret: the exact `CONVERT_SECRET` value

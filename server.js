@@ -13,7 +13,7 @@ const app = express();
 // file under the correct name and extension instead of a generic "download".
 app.use(
   cors({
-    exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges"],
+    exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges", "X-SCloud-Receipt", "X-SCloud-Remaining", "X-SCloud-Used-Today"],
   })
 );
 app.use(express.json());

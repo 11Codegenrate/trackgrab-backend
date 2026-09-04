@@ -88,11 +88,14 @@ const DIRECT_MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", fla
 
 // Signature for a browser-issued one-time direct ticket. The random ticket id and
 // every plan cap are signed, so a ticket cannot be replayed or widened.
-function validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig) {
+function validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig, commitUrl = "") {
   if (!SECRET || !sig || !exp) return false;
   if (Date.now() / 1000 > Number(exp) + SIG_LEEWAY_S) return false;
   if (!/^[a-zA-Z0-9_-]{20,80}$/.test(String(ticket || ""))) return false;
-  const payload = `direct|${format}|${quality}|${maxmb}|${maxdur}|${ticket}|${exp}`;
+  const base = `direct|${format}|${quality}|${maxmb}|${maxdur}|${ticket}|${exp}`;
+  // An empty callback retains compatibility with converter 1.6.8, which charged
+  // when issuing a ticket. Newer clients sign the callback URL and charge on success.
+  const payload = commitUrl ? `${base}|${commitUrl}` : base;
   const expected = crypto.createHmac("sha256", SECRET).update(payload).digest("hex");
   const a = Buffer.from(String(sig));
   const b = Buffer.from(expected);
@@ -105,8 +108,53 @@ function consumeDirectTicket(ticket, exp) {
     if (expires < now) usedDirectTickets.delete(key);
   }
   if (usedDirectTickets.has(ticket)) return false;
-  usedDirectTickets.set(ticket, Number(exp) || now + 180);
+  usedDirectTickets.set(ticket, (Number(exp) || now + 180) + SIG_LEEWAY_S + TIMEOUT_S);
   return true;
+}
+
+/** Commit one verified conversion to WordPress before releasing its output. */
+async function commitSuccessfulConversion(commitUrl, ticket, exp, receipt) {
+  let parsed;
+  try { parsed = new URL(commitUrl); } catch (e) { throw Object.assign(new Error("bad_commit_url"), { code: "bad_commit_url" }); }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw Object.assign(new Error("bad_commit_url"), { code: "bad_commit_url" });
+  }
+
+  const body = new URLSearchParams({
+    action: "scloud_ac_commit",
+    ticket,
+    exp: String(exp),
+    receipt,
+  });
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(parsed, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: body.toString(),
+        signal: controller.signal,
+      });
+      const json = await response.json();
+      if (response.ok && json && json.success) return json.data || {};
+
+      const code = String(json?.data?.code || `commit_http_${response.status}`);
+      const error = Object.assign(new Error(code), { code });
+      if (["free_limit", "invalid_receipt", "expired_receipt", "unknown_receipt", "security"].includes(code)) throw error;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+      if (["free_limit", "invalid_receipt", "expired_receipt", "unknown_receipt", "security", "bad_commit_url"].includes(String(error?.code || ""))) throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+  }
+
+  throw lastError || Object.assign(new Error("credit_commit_failed"), { code: "credit_commit_failed" });
 }
 
 // ffprobe the input duration (seconds); resolves 0 when it can't be read.
@@ -166,7 +214,7 @@ function verifyOutput(input, format) {
 }
 
 /** Run one bounded FFmpeg job, validate it, then stream it with correct headers. */
-function convertAndSend(req, res, { input, format, quality, prefix, name }) {
+function convertAndSend(req, res, { input, format, quality, prefix, name, successHeaders = {}, beforeSend = null }) {
   const spec = FORMATS[format];
   const output = path.join(os.tmpdir(), `${prefix}_${crypto.randomBytes(8).toString("hex")}.${spec.ext}`);
   const cleanup = () => { unlink(input); unlink(output); };
@@ -211,7 +259,21 @@ function convertAndSend(req, res, { input, format, quality, prefix, name }) {
     }
     if (res.writableEnded || res.destroyed) return cleanup();
 
+    let finalHeaders = { ...successHeaders };
+    if (beforeSend) {
+      try {
+        finalHeaders = { ...finalHeaders, ...(await beforeSend()) };
+      } catch (error) {
+        const code = String(error?.code || "credit_commit_failed");
+        console.error(`[${prefix}] credit commit failed:`, code);
+        return fail(code === "free_limit" ? 409 : 502, code === "free_limit" ? "credit_limit" : "credit_commit_failed");
+      }
+    }
+
     const outName = safeOutName(name, spec.ext);
+    for (const [header, value] of Object.entries(finalHeaders)) {
+      res.setHeader(header, String(value));
+    }
     res.setHeader("Content-Type", DIRECT_MIME[format] || "application/octet-stream");
     res.setHeader("Content-Disposition", `attachment; filename="${outName}"; filename*=UTF-8''${encodeURIComponent(outName)}`);
     res.setHeader("Content-Length", String(bytes));
@@ -303,9 +365,10 @@ router.post("/convert-direct", upload.single("file"), async (req, res) => {
   const maxdur = parseInt(req.body.maxdur || "0", 10) || 0;
   const ticket = String(req.body.ticket || "");
   const exp = req.body.exp, sig = req.body.sig;
+  const commitUrl = String(req.body.commit_url || "");
 
   if (!FORMATS[format]) return fail(400, "bad_format");
-  if (!validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig)) return fail(403, "bad_signature");
+  if (!validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig, commitUrl)) return fail(403, "bad_signature");
   if (maxmb > 0 && req.file.size > maxmb * 1024 * 1024) return fail(413, "file_too_large");
   if (active >= MAX_CONCURRENCY) return fail(503, "busy");
 
@@ -317,7 +380,26 @@ router.post("/convert-direct", upload.single("file"), async (req, res) => {
   }
 	if (!consumeDirectTicket(ticket, exp)) return fail(409, "ticket_used");
 
-  convertAndSend(req, res, { input, format, quality, prefix: "scloudd", name: req.body.name || "converted" });
+  // WordPress charges only after verified FFmpeg output exists. The commit happens
+  // server-to-server before the bytes are released, so skipping browser JavaScript
+  // cannot bypass the daily limit. Old 1.6.8 tickets have no callback and keep their
+  // original issue-time charging behaviour.
+  const receipt = crypto.createHmac("sha256", SECRET).update(`success|${ticket}|${exp}`).digest("hex");
+  convertAndSend(req, res, {
+    input,
+    format,
+    quality,
+    prefix: "scloudd",
+    name: req.body.name || "converted",
+    successHeaders: { "X-SCloud-Receipt": receipt },
+    beforeSend: commitUrl ? async () => {
+      const usage = await commitSuccessfulConversion(commitUrl, ticket, exp, receipt);
+      return {
+        "X-SCloud-Remaining": usage.remaining === null ? "unlimited" : String(Math.max(0, Number(usage.remaining || 0))),
+        "X-SCloud-Used-Today": String(Math.max(0, Number(usage.usedToday || 0))),
+      };
+    } : null,
+  });
 });
 
 router.get("/convert-health", (_req, res) => {
