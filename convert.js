@@ -145,6 +145,16 @@ function consumeDirectTicket(ticket, exp) {
   return true;
 }
 
+// Signed proof that a CHARGED ticket did not produce a file, so WordPress can
+// refund the daily-conversion count it reserved at ticket-issue time. Signed with
+// the shared convert secret, so a browser cannot forge a "failure" to dodge the
+// daily limit. Only ever emitted alongside consuming the ticket (single-use), so
+// a refunded ticket can never be retried for a free conversion.
+function refundToken(ticket, exp) {
+  if (!SECRET) return "";
+  return crypto.createHmac("sha256", SECRET).update(`refund|${ticket}|${exp}`).digest("hex");
+}
+
 // ffprobe the input duration (seconds); resolves 0 when it can't be read.
 function probeDuration(input) {
   return new Promise((resolve) => {
@@ -366,13 +376,19 @@ function verifyOutput(input, format) {
 }
 
 /** Run one bounded FFmpeg job, validate it, then stream it with correct headers. */
-function convertAndSend(req, res, { input, format, quality, prefix, name }) {
+function convertAndSend(req, res, { input, format, quality, prefix, name, refundTicket = "", refundExp = "" }) {
   const spec = FORMATS[format];
   const output = path.join(os.tmpdir(), `${prefix}_${crypto.randomBytes(8).toString("hex")}.${spec.ext}`);
   const cleanup = () => { unlink(input); unlink(output); };
   const fail = (code, msg) => {
     cleanup();
-    if (!res.headersSent && !res.writableEnded) res.status(code).json({ error: msg });
+    if (!res.headersSent && !res.writableEnded) {
+      const body = { error: msg };
+      // A charged ticket that failed to produce a file → hand WordPress a signed
+      // refund proof so it reverses the reserved daily-conversion count.
+      if (refundTicket) body.refund = refundToken(refundTicket, refundExp);
+      res.status(code).json(body);
+    }
   };
 
   active++;
@@ -513,18 +529,29 @@ router.post("/convert-direct", upload.single("file"), async (req, res) => {
 
   if (!FORMATS[format]) return fail(400, "bad_format");
   if (!validDirectSig(format, quality, maxmb, maxdur, ticket, exp, sig)) return fail(403, "bad_signature");
-  if (maxmb > 0 && req.file.size > maxmb * 1024 * 1024) return fail(413, "file_too_large");
+  // Busy is transient and the browser retries the SAME ticket, so check it BEFORE
+  // consuming — a 503 must not burn the ticket.
   if (active >= MAX_CONCURRENCY) return fail(503, "busy");
+
+  // The ticket is valid and was already charged by WordPress. Make it single-use
+  // NOW, so any failure below both refunds that charge and prevents a free retry
+  // with the same ticket. A replay of an already-used ticket gets no refund.
+  if (!consumeDirectTicket(ticket, exp)) return fail(409, "ticket_used");
+  const failRefund = (code, msg) => {
+    unlink(input);
+    if (!res.headersSent && !res.writableEnded) res.status(code).json({ error: msg, refund: refundToken(ticket, exp) });
+  };
+
+  if (maxmb > 0 && req.file.size > maxmb * 1024 * 1024) return failRefund(413, "file_too_large");
 
   // Enforce the signed duration cap (plan limit) before spending CPU on convert.
   if (maxdur > 0) {
     const dur = await probeDuration(input);
-    if (dur <= 0) return fail(400, "unreadable");
-    if (dur > maxdur + 1) return fail(413, "too_long");
+    if (dur <= 0) return failRefund(400, "unreadable");
+    if (dur > maxdur + 1) return failRefund(413, "too_long");
   }
-	if (!consumeDirectTicket(ticket, exp)) return fail(409, "ticket_used");
 
-  convertAndSend(req, res, { input, format, quality, prefix: "scloudd", name: req.body.name || "converted" });
+  convertAndSend(req, res, { input, format, quality, prefix: "scloudd", name: req.body.name || "converted", refundTicket: ticket, refundExp: exp });
 });
 
 /* -------- POST /convert-source : URL / Drive / Dropbox / OneDrive -------- */
@@ -544,9 +571,15 @@ router.post("/convert-source", upload.none(), async (req, res) => {
   const sig = req.body.sig;
   const input = path.join(os.tmpdir(), `scloudsrc_${crypto.randomBytes(12).toString("hex")}`);
   let sourceSlot = false;
+  let consumed = false;
   const fail = (code, msg) => {
     unlink(input);
-    if (!res.headersSent && !res.writableEnded) res.status(code).json({ error: msg });
+    if (!res.headersSent && !res.writableEnded) {
+      const body = { error: msg };
+      // Refund the reserved count only once the ticket has been consumed (charged).
+      if (consumed) body.refund = refundToken(ticket, exp);
+      res.status(code).json(body);
+    }
   };
 
   if (!FORMATS[format]) return fail(400, "bad_format");
@@ -554,7 +587,13 @@ router.post("/convert-source", upload.none(), async (req, res) => {
     return fail(403, "bad_signature");
   }
   if (sourceRef.length < 1 || sourceRef.length > 5000 || accessToken.length > 12000) return fail(400, "bad_source");
+  // Busy is transient and retried with the SAME ticket → check before consuming.
   if (active + activeSources >= MAX_CONCURRENCY) return fail(503, "busy");
+
+  // Charged ticket → single-use now; every failure below refunds it (see fail()),
+  // and the ticket can't be retried for a free conversion.
+  if (!consumeDirectTicket(ticket, exp)) return fail(409, "ticket_used");
+  consumed = true;
 
   activeSources++;
   sourceSlot = true;
@@ -564,11 +603,10 @@ router.post("/convert-source", upload.none(), async (req, res) => {
     const dur = await probeDuration(input);
     if (dur <= 0) throw new SourceError("unreadable", 400);
     if (maxdur > 0 && dur > maxdur + 1) throw new SourceError("too_long", 413);
-    if (!consumeDirectTicket(ticket, exp)) throw new SourceError("ticket_used", 409);
 
     activeSources = Math.max(0, activeSources - 1);
     sourceSlot = false;
-    convertAndSend(req, res, { input, format, quality, prefix: `scloud-${provider}`, name: req.body.name || "converted" });
+    convertAndSend(req, res, { input, format, quality, prefix: `scloud-${provider}`, name: req.body.name || "converted", refundTicket: ticket, refundExp: exp });
   } catch (e) {
     if (sourceSlot) activeSources = Math.max(0, activeSources - 1);
     const status = e instanceof SourceError ? e.status : 502;

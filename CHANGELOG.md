@@ -2,6 +2,7 @@
 
 ## 1.3.0
 
+- Converter (`/convert-direct`, `/convert-source`): a **failed** conversion no longer costs the user a daily conversion. When a charged ticket can't produce a file, the response now includes a `refund` proof (HMAC of `refund|ticket|exp` with the convert secret) and the ticket is made single-use, so WordPress reverses the reserved count. A successful conversion returns no proof, and the signature stops a client faking a failure. A transient `busy` (503) is still retried with the same ticket and never consumes/refunds it.
 - Downloads (`/download`): lossy formats (MP3, M4A/MP4) are now always encoded at a real constant bitrate (default 320 kbps; MP3 uses true CBR via matching `-b:a/-minrate/-maxrate`). SoundCloud only serves a ~128 kbps source, but the delivered file now advertises the target bitrate in its metadata, so a bitrate checker / file-properties dialog shows 320 kbps — stopping "low bitrate" refund disputes. WAV/FLAC are unchanged (lossless).
 - Converter (`/convert`, `/convert-direct`, `/convert-source`): M4A output now honours the selected quality (up to 320 kbps) instead of a fixed 128; MP3 is encoded true-CBR so the file reports the exact chosen bitrate.
 - Converter: added a hard cap on the GENERATED output file (`CONVERT_OUTPUT_MAX_MB`, default 500). An over-large result (e.g. a huge WAV blown up from a small lossy input) is rejected with `output_too_large` and deleted instead of streamed. Input cap (`CONVERT_MAX_MB`) is unchanged and independent.
