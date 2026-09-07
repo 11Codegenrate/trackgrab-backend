@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+
+- Automatic VPS temp-file cleanup: a periodic sweeper removes orphaned `trackgrab-*` / `scloud*` temp files and directories in the system temp dir once they are older than `TEMP_MAX_AGE_MIN` (default 60), guarding against disk fill from crashes, SIGKILLs, per-job timeouts or aborted uploads. Runs every `TEMP_SWEEP_INTERVAL_MIN` (default 15), uses mtime only (never reaps a file still being written), and leaves the yt-dlp cache alone. Each job still cleans up after itself as before.
+- Multer uploads now use a `scloudup_` temp-file prefix so the sweeper can reclaim orphaned uploads.
+
 ## 1.3.0
 
 - Converter (`/convert-direct`, `/convert-source`): a **failed** conversion no longer costs the user a daily conversion. When a charged ticket can't produce a file, the response now includes a `refund` proof (HMAC of `refund|ticket|exp` with the convert secret) and the ticket is made single-use, so WordPress reverses the reserved count. A successful conversion returns no proof, and the signature stops a client faking a failure. A transient `busy` (503) is still retried with the same ticket and never consumes/refunds it.

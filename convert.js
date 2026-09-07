@@ -87,7 +87,15 @@ const FORMATS = {
 };
 
 const router = express.Router();
-const upload = multer({ dest: os.tmpdir(), limits: { fileSize: MAX_MB * 1024 * 1024, files: 1 } });
+// Give multer's uploaded temp files a known prefix so the periodic temp sweeper
+// (server.js) can identify and reclaim orphans left by a crash/SIGKILL/aborted
+// upload. Without a prefix multer uses a bare random name the age-based sweep
+// can't safely target.
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+  filename: (_req, _file, cb) => cb(null, `scloudup_${crypto.randomBytes(12).toString("hex")}`),
+});
+const upload = multer({ storage: uploadStorage, limits: { fileSize: MAX_MB * 1024 * 1024, files: 1 } });
 let active = 0;
 let activeSources = 0;
 const usedDirectTickets = new Map();

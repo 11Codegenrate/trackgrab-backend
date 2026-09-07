@@ -755,6 +755,52 @@ app.get("/diag", (req, res) => {
   toolVersion(ffmpegProbePath(), ["-version"], (r) => { out.ffmpeg = r; done(); });
 });
 
+// ── Temp-file sweeper ─────────────────────────────────────────────────────────
+// Every download/convert job deletes its own temp files on completion, but a
+// crash, SIGKILL, per-job timeout or an aborted browser upload can still strand
+// orphans in os.tmpdir(); left alone they slowly fill the VPS disk. This periodic
+// sweep removes only OUR temp files/dirs (known "trackgrab-"/"scloud" prefixes)
+// once they are older than TEMP_MAX_AGE_MIN — comfortably longer than the longest
+// job (download 900s / convert 600s), so a file that is still being written is
+// never reaped (its mtime keeps it fresh). The yt-dlp cache dir is intentionally
+// NOT matched, so cached client_id/extractor data survives.
+const TEMP_DIR = os.tmpdir();
+const TEMP_PREFIXES = ["trackgrab-", "scloud"];
+const TEMP_MAX_AGE_MS = Math.max(15, parseInt(process.env.TEMP_MAX_AGE_MIN || "60", 10) || 60) * 60 * 1000;
+const TEMP_SWEEP_MS = Math.max(1, parseInt(process.env.TEMP_SWEEP_INTERVAL_MIN || "15", 10) || 15) * 60 * 1000;
+
+function sweepTempOnce() {
+  let entries;
+  try { entries = fs.readdirSync(TEMP_DIR); } catch (e) { return; }
+  const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+  let removed = 0;
+  for (const name of entries) {
+    if (!TEMP_PREFIXES.some((p) => name.startsWith(p))) continue;
+    const full = path.join(TEMP_DIR, name);
+    let st;
+    try { st = fs.statSync(full); } catch (e) { continue; }
+    // mtime is updated while a job is actively writing the file, so anything whose
+    // mtime is older than the (generous) cutoff is a finished/abandoned orphan —
+    // the longest job is ~15 min, well under the 60 min default.
+    if (st.mtimeMs > cutoff) continue;
+    try {
+      if (st.isDirectory()) fs.rmSync(full, { recursive: true, force: true });
+      else fs.unlinkSync(full);
+      removed++;
+    } catch (e) {}
+  }
+  if (removed) {
+    console.log(`[sweep] removed ${removed} stale temp item(s) older than ${Math.round(TEMP_MAX_AGE_MS / 60000)}m`);
+  }
+}
+
+function startTempSweeper() {
+  try { sweepTempOnce(); } catch (e) {}
+  const timer = setInterval(() => { try { sweepTempOnce(); } catch (e) {} }, TEMP_SWEEP_MS);
+  timer.unref(); // never keep the process alive just for the sweep
+  console.log(`✓ temp sweeper active (every ${Math.round(TEMP_SWEEP_MS / 60000)}m, max age ${Math.round(TEMP_MAX_AGE_MS / 60000)}m)`);
+}
+
 // Log tool availability at boot so a missing yt-dlp/ffmpeg is obvious in pm2 logs.
 function selfCheck() {
   toolVersion(YTDLP_BIN, ["--version"], (r) =>
@@ -768,6 +814,7 @@ const PORT = process.env.PORT || 3001;
 const server = app.listen(PORT, () => {
   console.log(`TrackGrab server running on port ${PORT}`);
   selfCheck();
+  startTempSweeper();
 });
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
