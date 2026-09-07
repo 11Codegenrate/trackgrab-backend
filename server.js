@@ -7,13 +7,24 @@ const fs = require("fs");
 const crypto = require("crypto");
 const app = express();
 
+const CORS_ORIGINS = String(process.env.CONVERT_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((value) => value.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
 // Expose the download headers to cross-origin browser JS. The WordPress tool page
 // and this API are different origins, so without this the in-page downloader can't
 // read the server's real filename or size — which is what lets iOS/Android save the
 // file under the correct name and extension instead of a generic "download".
 app.use(
   cors({
-    exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges", "X-SCloud-Receipt", "X-SCloud-Remaining", "X-SCloud-Used-Today"],
+    origin(origin, done) {
+      if (!origin || !CORS_ORIGINS.length || CORS_ORIGINS.includes(origin.replace(/\/$/, ""))) return done(null, true);
+      return done(null, false);
+    },
+    exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges"],
+    methods: ["GET", "POST", "OPTIONS"],
+    maxAge: 86400,
   })
 );
 app.use(express.json());
@@ -236,15 +247,43 @@ function normalizeBitrate(raw) {
   return String(n);
 }
 
+// Bitrate (kbps) a lossy download is encoded at. SoundCloud only serves a
+// ~128 kbps source, but customers judge quality by what a bitrate checker /
+// file-properties dialog reports, and a Pro buyer who sees "128 kbps" on the
+// file they paid for opens a refund dispute. So lossy output is ALWAYS encoded
+// at a real target bitrate (default 320) — never left at yt-dlp's VBR guess,
+// which for a 128 kbps source would advertise ~128. The WordPress signed link
+// supplies the plan bitrate; 320 is the floor/default when it doesn't.
+function lossyBitrate(opts) {
+  const n = parseInt(String(opts && opts.bitrate ? opts.bitrate : ""), 10);
+  if (!Number.isFinite(n) || n < 64) return "320";
+  if (n > 320) return "320";
+  return String(n);
+}
+
+// Extra ffmpeg args for the AUDIO-EXTRACT postprocessor only (yt-dlp key
+// "ExtractAudio:"), so they never touch the separate cover-art embed step.
+// --audio-quality already sets -b:a <brate>k; for MP3 we add matching
+// -minrate/-maxrate/-bufsize so libmp3lame produces a TRUE constant bitrate and
+// a bitrate checker reports exactly that value (e.g. 320) with no ambiguity.
+// AAC (m4a) reports ~brate from -b:a alone; lossless (wav/flac) needs nothing.
+function extractAudioCbrArgs(fmt, opts) {
+  if (fmt.lossless || fmt.audioFormat !== "mp3") return "";
+  const brate = lossyBitrate(opts);
+  return `-minrate ${brate}k -maxrate ${brate}k -bufsize ${brate}k`;
+}
+
 // Build the yt-dlp argument list for a format + plan-derived options.
-// - bitrate: lossy formats encode CBR at "<bitrate>K"; lossless ignore it.
+// - bitrate: lossy formats encode CBR at "<bitrate>K" (default 320); lossless ignore it.
 // - meta: embed title/artist/etc. tags and cover art (where the container supports it).
 function buildYtdlpArgs(fmt, opts) {
   const args = ["-x", "--audio-format", fmt.audioFormat];
 
   if (!fmt.lossless) {
-    // "<n>K" tells ffmpeg to target that exact bitrate; "0" = best VBR.
-    args.push("--audio-quality", opts.bitrate ? `${opts.bitrate}K` : "0");
+    // Always target a real bitrate (default 320). For MP3 the CBR is enforced by
+    // the audio-extract post-processor args (see extractAudioCbrArgs) so the
+    // finished file advertises this exact bitrate.
+    args.push("--audio-quality", `${lossyBitrate(opts)}K`);
   }
 
   if (opts.meta && fmt.canEmbed) {
@@ -522,8 +561,11 @@ app.get("/download", (req, res) => {
       // re-resolving it on every single download (one fewer network round-trip per job).
       "--cache-dir", YTDLP_CACHE_DIR,
       // Speed: let ffmpeg's post-processing (encode/mux) use every available core.
-      // No effect on single-threaded codecs (mp3), a real win on flac/wav/aac.
       "--postprocessor-args", "ffmpeg:-threads 0",
+      // Honest bitrate: force a true constant bitrate on the audio-extract step
+      // only (never the cover-art embed step) so the delivered lossy file reports
+      // exactly the target bitrate — default 320. Empty for m4a/lossless.
+      ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
       // Point yt-dlp at a bundled ffmpeg when one is provided (container builds);
       // empty by default so system-PATH ffmpeg keeps working on existing installs.
       ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),

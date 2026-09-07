@@ -22,6 +22,8 @@ module.exports = {
         CONVERT_MAX_MB: "500",
         CONVERT_CONCURRENCY: "1",
         CONVERT_TIMEOUT_S: "600",
+        CONVERT_SOURCE_TIMEOUT_S: "180",
+        CONVERT_ALLOWED_ORIGINS: "https://downloadscloudmp3.com",
         M4A_BITRATE: "128",
       },
     },

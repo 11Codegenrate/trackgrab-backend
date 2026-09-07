@@ -1,9 +1,18 @@
 # Changelog
 
-## 1.1.4
+## 1.3.0
 
-- Direct audio conversion now commits a WordPress credit only after FFmpeg creates and verifies the requested output. Unreadable uploads and failed conversions are not charged.
-- Successful direct conversions include signed receipt and live usage headers for the converter counter. The server-to-server commit happens before output is released, preserving quota enforcement.
+- Downloads (`/download`): lossy formats (MP3, M4A/MP4) are now always encoded at a real constant bitrate (default 320 kbps; MP3 uses true CBR via matching `-b:a/-minrate/-maxrate`). SoundCloud only serves a ~128 kbps source, but the delivered file now advertises the target bitrate in its metadata, so a bitrate checker / file-properties dialog shows 320 kbps — stopping "low bitrate" refund disputes. WAV/FLAC are unchanged (lossless).
+- Converter (`/convert`, `/convert-direct`, `/convert-source`): M4A output now honours the selected quality (up to 320 kbps) instead of a fixed 128; MP3 is encoded true-CBR so the file reports the exact chosen bitrate.
+- Converter: added a hard cap on the GENERATED output file (`CONVERT_OUTPUT_MAX_MB`, default 500). An over-large result (e.g. a huge WAV blown up from a small lossy input) is rejected with `output_too_large` and deleted instead of streamed. Input cap (`CONVERT_MAX_MB`) is unchanged and independent.
+- `/convert-health`, `/diag` and `/` now report `maxInputMb` and `maxOutputMb`.
+
+## 1.2.0
+
+- Added signed `/convert-source` imports for direct audio URLs, Google Drive, Dropbox and OneDrive.
+- Added streaming input-size enforcement, duration probing, redirect limits and SSRF protection for every remote hop.
+- OAuth tokens are accepted only for the current conversion and are never persisted or logged.
+- Added optional `CONVERT_ALLOWED_ORIGINS` CORS restriction and source-import health status.
 
 ## 1.1.3
 

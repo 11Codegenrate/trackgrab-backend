@@ -32,5 +32,9 @@ services:
         value: "1"
       - key: CONVERT_TIMEOUT_S
         value: "600"
+      - key: CONVERT_SOURCE_TIMEOUT_S
+        value: "180"
+      - key: CONVERT_ALLOWED_ORIGINS
+        value: "https://downloadscloudmp3.com"
       - key: M4A_BITRATE
         value: "128"

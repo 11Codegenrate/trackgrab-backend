@@ -6,7 +6,6 @@
 - Every job has a hard timeout, aborted clients stop their child process, error logs are capped, and PM2 restarts the service after a crash or memory spike.
 - The server probes completed output and refuses to send a file when its real container/codec does not match the requested MP3, MP4/M4A, WAV or FLAC format.
 - M4A conversion uses 128 kbps AAC instead of inheriting the MP3 selector's 192 kbps default.
-- Direct converter credits are committed only after FFmpeg creates and verifies the requested output; failed or unreadable uploads are not charged.
 - `/diag`, `/convert-health`, and `npm run monitor` expose the signals needed to distinguish a WordPress/Cloudflare outage from a VPS/FFmpeg outage.
 
 ## Current live abnormality found on 27 August 2026
@@ -30,6 +29,8 @@ cd /path/to/trackgrab-backend
 npm ci --omit=dev
 export SCLOUD_API_SECRET='existing-downloader-secret'
 export CONVERT_SECRET='existing-converter-secret'
+export CONVERT_ALLOWED_ORIGINS='https://downloadscloudmp3.com'
+export CONVERT_SOURCE_TIMEOUT_S='180'
 pm2 startOrReload ecosystem.config.cjs --update-env
 pm2 save
 curl -fsS https://api.downloadscloudmp3.com/diag
@@ -64,10 +65,12 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## Deploy WordPress converter
 
-Upload `scloud-audio-converter-1.6.9.zip`, replace/upgrade the existing plugin, and confirm these existing settings still match the VPS. Converter 1.6.9 and backend 1.1.4 must be deployed together because the success-receipt callback is shared by both packages:
+Upload `scloud-audio-converter-1.7.0.zip`, replace/upgrade the existing plugin, and confirm these settings match the VPS:
 
 - Convert service URL: `https://api.downloadscloudmp3.com`
 - Convert secret: the exact `CONVERT_SECRET` value
+
+Backend 1.2.0 adds `/convert-source` for direct URLs, Google Drive, Dropbox and OneDrive. `CONVERT_ALLOWED_ORIGINS` accepts a comma-separated list of exact WordPress origins. The backend validates every redirect and rejects local/private network destinations before it streams a remote file.
 
 The converter page no longer renders the Pro promotion card or Back to home link.
 
