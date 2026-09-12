@@ -292,6 +292,24 @@ function sourceRequest(provider, sourceRef, accessToken) {
   throw new SourceError("bad_provider", 400);
 }
 
+// A Drive `alt=media` download very often 302-redirects from www.googleapis.com to
+// one of Google's own file-serving hosts, and THAT host still needs the bearer to
+// authorize the byte stream. Stripping the token on every redirect (the safe rule
+// for arbitrary hosts) therefore breaks Google downloads. So for the google
+// provider we keep forwarding the token to Google-owned hosts only — never to a
+// third party. Other providers keep the strict first-host-only rule.
+function authAllowedHost(provider, host, firstHost) {
+  const h = String(host || "").toLowerCase();
+  if (h === firstHost) return true;
+  if (provider === "google") {
+    return h === "drive.usercontent.google.com" ||
+      h.endsWith(".googleusercontent.com") ||
+      h.endsWith(".googleapis.com") ||
+      h.endsWith(".l.google.com");
+  }
+  return false;
+}
+
 async function downloadSource(provider, sourceRef, accessToken, output, maxBytes) {
   const source = sourceRequest(provider, sourceRef, accessToken);
   const firstHost = new URL(source.url).hostname.toLowerCase();
@@ -304,18 +322,25 @@ async function downloadSource(provider, sourceRef, accessToken, output, maxBytes
     for (let hop = 0; hop <= SOURCE_REDIRECTS; hop++) {
       const parsed = new URL(current);
       const headers = { "User-Agent": "SCloud-Audio-Converter/1.2" };
-      // Never forward a Google/Microsoft bearer token to a redirect host.
-      if (source.authorization && parsed.hostname.toLowerCase() === firstHost) headers.Authorization = source.authorization;
+      // Forward the bearer only to the origin host and (for Google) its own
+      // download hosts — never to a third party a redirect might point at.
+      if (source.authorization && authAllowedHost(provider, parsed.hostname, firstHost)) {
+        headers.Authorization = source.authorization;
+      }
       response = await publicRequest(parsed, headers, controller.signal);
       const status = Number(response.statusCode || 0);
       if ([301, 302, 303, 307, 308].includes(status)) {
-        if (hop >= SOURCE_REDIRECTS) throw new SourceError("too_many_redirects", 400);
         const location = response.headers.location;
+        console.error("[convert-source]", provider, "hop", hop, parsed.hostname, "->", status,
+          location ? "redirect " + (() => { try { return new URL(location, parsed).hostname; } catch (e) { return "(bad location)"; } })() : "(NO location header)");
+        if (hop >= SOURCE_REDIRECTS) throw new SourceError("too_many_redirects", 400);
         if (!location) throw new SourceError("source_download_failed", 502);
         response.resume();
         current = new URL(location, parsed).toString();
         continue;
       }
+      console.error("[convert-source]", provider, "hop", hop, parsed.hostname, "->", status,
+        "type", response.headers["content-type"] || "?", "len", response.headers["content-length"] || "?");
       break;
     }
     if (!response) throw new SourceError("source_download_failed", 502);

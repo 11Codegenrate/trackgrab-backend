@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.3
+
+- Google Drive source imports (`/convert-source`): fixed downloads that failed with "The source could not be downloaded." `alt=media` frequently 302-redirects from `www.googleapis.com` to one of Google's own file-serving hosts (`drive.usercontent.google.com`, `*.googleusercontent.com`), and that host still needs the OAuth bearer to authorize the byte stream. We were stripping the token on every redirect, so the follow-up request failed. The bearer is now forwarded to Google-owned hosts only (never to a third party); other providers keep the strict first-host-only rule.
+- `/convert-source` now logs each hop (host → status, redirect target or content-type/length) so cloud-import issues are fully diagnosable from the VPS log. Tokens are never logged.
+
 ## 1.3.2
 
 - Google Drive source imports (`/convert-source`): the Drive `alt=media` download now sends `acknowledgeAbuse=true` (and `supportsAllDrives=true`). Without it Google refuses to serve any file its own scanner has flagged — extremely common for music tracks that were themselves downloaded from the web — which surfaced in the converter as "The source could not be downloaded. Please choose it again." Picked audio now downloads and converts.
