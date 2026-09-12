@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.4
+
+- Google Drive / cloud imports (`/convert-source`): fixed the real cause of "The source could not be downloaded" — the SSRF-safe downloader resolved the source host itself and pinned the address with `dns.lookup(..., { verbatim: true })`, which returned an IPv6 record first. This VPS has no working IPv6 egress, so pinning it threw `ERR_INVALID_IP_ADDRESS` and the request never reached Google. The resolver now prefers a valid IPv4 address (filtering malformed records and coercing the family), falling back to IPv6 only when no A record exists. SSRF protection (private-range blocking, IP pinning) is unchanged.
+
 ## 1.3.3
 
 - Google Drive source imports (`/convert-source`): fixed downloads that failed with "The source could not be downloaded." `alt=media` frequently 302-redirects from `www.googleapis.com` to one of Google's own file-serving hosts (`drive.usercontent.google.com`, `*.googleusercontent.com`), and that host still needs the OAuth bearer to authorize the byte stream. We were stripping the token on every redirect, so the follow-up request failed. The bearer is now forwarded to Google-owned hosts only (never to a third party); other providers keep the strict first-host-only rule.

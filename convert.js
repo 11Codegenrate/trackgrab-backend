@@ -223,12 +223,19 @@ async function assertPublicUrl(raw) {
     return { parsed, address: literalHost, family: net.isIP(literalHost) };
   }
   let addresses;
-  try { addresses = await dns.lookup(parsed.hostname, { all: true, verbatim: true }); }
+  try { addresses = await dns.lookup(parsed.hostname, { all: true }); }
   catch (e) { throw new SourceError("source_not_found", 404); }
+  // Drop anything that isn't a syntactically valid IP before we pin it.
+  addresses = (addresses || []).filter((row) => net.isIP(row.address) !== 0);
   if (!addresses.length || addresses.some((row) => blockedIp(row.address))) {
     throw new SourceError("unsafe_source", 400);
   }
-  return { parsed, address: addresses[0].address, family: addresses[0].family };
+  // Prefer IPv4: it is always a clean dotted quad the connector accepts, and this
+  // VPS has no working IPv6 egress — pinning a resolved IPv6 threw
+  // ERR_INVALID_IP_ADDRESS and killed every Drive/cloud download. Fall back to the
+  // first (v6) address only when no IPv4 record exists.
+  const chosen = addresses.find((row) => Number(row.family) === 4) || addresses[0];
+  return { parsed, address: chosen.address, family: Number(chosen.family) === 6 ? 6 : 4 };
 }
 
 // Pin the HTTP connection to the exact DNS address validated above. This closes
@@ -242,8 +249,9 @@ async function publicRequest(raw, headers, signal) {
       method: "GET",
       headers,
       signal,
+      family: approved.family,
       lookup(_hostname, _options, callback) {
-        callback(null, approved.address, approved.family);
+        callback(null, approved.address, approved.family === 6 ? 6 : 4);
       },
     }, resolve);
     request.once("error", reject);
@@ -661,7 +669,7 @@ router.post("/convert-source", upload.none(), async (req, res) => {
     if (sourceSlot) activeSources = Math.max(0, activeSources - 1);
     const status = e instanceof SourceError ? e.status : 502;
     const code = e instanceof SourceError ? e.code : "source_download_failed";
-    if (!(e instanceof SourceError)) console.error("[convert-source]", e.code || e.message || e);
+    if (!(e instanceof SourceError)) console.error("[convert-source]", provider, e.code || "", e.message || e);
     fail(status, code);
   }
 });
