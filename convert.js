@@ -261,7 +261,11 @@ function sourceRequest(provider, sourceRef, accessToken) {
   if (provider === "google") {
     if (!/^[a-zA-Z0-9_-]{5,220}$/.test(sourceRef) || !accessToken) throw new SourceError("bad_source", 400);
     return {
-      url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(sourceRef)}?alt=media`,
+    // acknowledgeAbuse=true is REQUIRED for Drive to serve a file its scanner has
+    // flagged (very common for music tracks that were themselves downloaded from
+    // the web); without it the media endpoint answers 403 cannotDownloadAbusiveFile.
+    // supportsAllDrives lets picked files that live on a shared drive download too.
+      url: `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(sourceRef)}?alt=media&acknowledgeAbuse=true&supportsAllDrives=true`,
       authorization: `Bearer ${accessToken}`,
     };
   }
@@ -316,9 +320,22 @@ async function downloadSource(provider, sourceRef, accessToken, output, maxBytes
     }
     if (!response) throw new SourceError("source_download_failed", 502);
     const status = Number(response.statusCode || 0);
-    if (status === 401 || status === 403) throw new SourceError("source_auth_failed", 401);
-    if (status === 404) throw new SourceError("source_not_found", 404);
-    if (status < 200 || status >= 300) throw new SourceError("source_download_failed", 502);
+    if (status < 200 || status >= 300) {
+      // Read a small slice of the provider's error body so the reason (e.g.
+      // cannotDownloadAbusiveFile, insufficientFilePermissions) shows in the log.
+      // Tokens are never included — this is only the provider's own response.
+      let reason = "";
+      try {
+        let acc = "";
+        for await (const chunk of response) { acc += chunk.toString(); if (acc.length > 2048) break; }
+        const m = acc.match(/"reason"\s*:\s*"([^"]+)"/) || acc.match(/"message"\s*:\s*"([^"]+)"/);
+        reason = m ? m[1] : acc.slice(0, 200).replace(/\s+/g, " ").trim();
+      } catch (e) {}
+      console.error("[convert-source]", provider, "HTTP", status, reason);
+      if (status === 401 || status === 403) throw new SourceError("source_auth_failed", 401);
+      if (status === 404) throw new SourceError("source_not_found", 404);
+      throw new SourceError("source_download_failed", 502);
+    }
     const declared = parseInt(response.headers["content-length"] || "0", 10) || 0;
     if (maxBytes > 0 && declared > maxBytes) throw new SourceError("file_too_large", 413);
 
