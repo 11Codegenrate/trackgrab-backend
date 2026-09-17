@@ -57,6 +57,18 @@ Diagnostics must report `"version":"1.3.7"` and `ytdlp.ok`, `ffmpeg.ok`, and `ff
 | `DOWNLOAD_QUEUE_TIMEOUT_S` | `60` | Maximum wait for a downloader slot |
 | `SHUTDOWN_GRACE_S` | `930` | Default download timeout plus 30 seconds |
 | PM2 `kill_timeout` | `960000` ms | Allows application shutdown grace to finish |
+| `SOUNDCLOUD_PROXY` | _(none)_ | Route all SoundCloud requests through this proxy URL. Set it to an egress in a region where the catalogue is available to recover "unavailable in the server's region" tracks. Falls back to `HTTPS_PROXY`/`HTTP_PROXY` if unset. |
+| `SOUNDCLOUD_GEO_BYPASS_COUNTRY` | _(auto)_ | Force yt-dlp geo-bypass to a country code (e.g. `US`, `GB`, `DE`). Leave unset for automatic `--geo-bypass`; set `off` to disable it entirely. |
+
+### Region recovery (1.3.8) — download every listed track
+
+The single biggest cause of "0 full downloads" in a test is the **server's own region**: SoundCloud geo-blocks many tracks (and even their previews) for the IP the backend runs on. To get the coverage a competitor in another region has:
+
+1. Deploy on (or route through) an egress where the catalogue is available. Set `SOUNDCLOUD_PROXY=http://user:pass@host:port` (an HTTP/HTTPS or SOCKS proxy yt-dlp accepts). This is the actual "bypass" — it makes region-locked streams and previews reachable.
+2. `--geo-bypass` is on by default and needs no proxy; it clears some (not all) geo blocks on its own.
+3. Even with neither, the backend now falls back to the public ~30s **preview** snippet for any track whose full stream is unavailable (geo/Go+/DRM/forbidden), so a listed track downloads a labeled `(preview)` file instead of failing. It cannot recover full audio SoundCloud withholds (true DRM) or a track that is geo-blocked from the server with no allowed-region proxy.
+
+Confirm the active setup at `/diag` → `region` (e.g. `{ "proxy": "configured", "geoBypass": "auto", "previewFallback": true }`).
 
 If the shutdown grace is increased, increase PM2's `kill_timeout` to exceed it. A reload may wait for an active download to finish. Avoid repeated restarts while testing downloads.
 

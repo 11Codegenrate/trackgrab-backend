@@ -160,7 +160,15 @@ function soundCloudArgs() {
   // Explicitly try every format supported by the extractor. MP3 output does not
   // require an MP3 source; AAC/Opus are converted by FFmpeg. Local yt-dlp config
   // must not force an obsolete format, simulate downloads or enable DRM formats.
-  return ["--ignore-config", "--extractor-args", "soundcloud:formats=*", "--socket-timeout", "20", "--cache-dir", YTDLP_CACHE_DIR];
+  const args = ["--ignore-config", "--extractor-args", "soundcloud:formats=*", "--socket-timeout", "20", "--cache-dir", YTDLP_CACHE_DIR];
+  // Route through the configured region proxy first (recovers region-locked tracks).
+  if (SOUNDCLOUD_PROXY) args.push("--proxy", SOUNDCLOUD_PROXY);
+  // Then yt-dlp's own geo circumvention, unless explicitly turned off.
+  if (!GEO_BYPASS_OFF) {
+    if (GEO_BYPASS_COUNTRY) args.push("--geo-bypass-country", GEO_BYPASS_COUNTRY);
+    else args.push("--geo-bypass");
+  }
+  return args;
 }
 
 // The extractor marks previews in the source format ID and ranks them below
@@ -239,6 +247,16 @@ const FFMPEG_LOCATION = process.env.FFMPEG_LOCATION || ""; // dir containing ffm
 // jobs so each new download skips re-resolving it — a real per-request round-trip
 // saved. tmp is always writable, even on read-only container filesystems.
 const YTDLP_CACHE_DIR = process.env.YTDLP_CACHE_DIR || path.join(os.tmpdir(), "yt-dlp-cache");
+// Optional outbound proxy for SoundCloud requests. Point it at an egress in a
+// region where the catalogue is available to recover "unavailable in the server's
+// region" tracks (this is how region-locked streams/previews are reached). Off
+// unless set. Accepts SOUNDCLOUD_PROXY, else the conventional HTTPS/HTTP_PROXY.
+const SOUNDCLOUD_PROXY = String(process.env.SOUNDCLOUD_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
+// yt-dlp's built-in geo circumvention (spoofs X-Forwarded-For). Enabled by default
+// since it is harmless for unrestricted tracks and often clears a geo block. Set
+// SOUNDCLOUD_GEO_BYPASS_COUNTRY=US (etc.) to force a country, or =off to disable.
+const GEO_BYPASS_COUNTRY = String(process.env.SOUNDCLOUD_GEO_BYPASS_COUNTRY || "").trim().toUpperCase();
+const GEO_BYPASS_OFF = GEO_BYPASS_COUNTRY === "OFF" || GEO_BYPASS_COUNTRY === "0" || GEO_BYPASS_COUNTRY === "NONE";
 
 // Clamp a requested MP3 bitrate to a sane CBR value; "" means "let yt-dlp pick best".
 function normalizeBitrate(raw) {
@@ -471,6 +489,7 @@ app.get("/download", (req, res) => {
       activeWorkDirs.add(workDir);
       let result, produced, info, isPreview = false;
       let includeMeta = opts.meta;
+      let triedPreviewFallback = false;
       for (let attempt = 0; attempt < DOWNLOAD_ATTEMPTS; attempt++) {
         const attemptDir = path.join(workDir, String(attempt));
         fs.mkdirSync(attemptDir);
@@ -509,6 +528,39 @@ app.get("/download", (req, res) => {
           !["drm_protected", "geo_restricted", "track_private", "rate_limited", "preview_only"].includes(info.code);
         if (optionalMetaFailure) includeMeta = false;
         if (attempt + 1 >= DOWNLOAD_ATTEMPTS || (!optionalMetaFailure && !info.retryable) || Date.now() >= deadline) {
+          // Last resort so no listed track hard-fails: when SoundCloud gave us no
+          // usable full/available stream (geo, Go+/DRM, "preview only", forbidden),
+          // try once more forcing ANY playable source — including the public 30s
+          // preview snippet — with the availability/fragment guards relaxed so a
+          // flaky-but-present snippet still downloads. This does NOT circumvent DRM
+          // or fabricate audio SoundCloud withholds; it only grabs what is playable.
+          const previewFallbackCodes = ["geo_restricted", "drm_protected", "preview_only", "audio_unavailable", "upstream_forbidden", "upstream_unavailable", "download_failed"];
+          if (!triedPreviewFallback && previewFallbackCodes.includes(info.code) && !controller.signal.aborted && !res.destroyed && Date.now() < deadline) {
+            triedPreviewFallback = true;
+            const pvDir = path.join(workDir, "preview");
+            fs.mkdirSync(pvDir);
+            const pvOut = path.join(pvDir, "audio.%(ext)s");
+            const pv = await runTool(YTDLP_BIN, [
+              ...soundCloudArgs(), ...buildYtdlpArgs(fmt, { ...opts, meta: false }),
+              // Accept anything playable, preview snippet included; no format
+              // pre-check and skip (don't abort on) unavailable fragments.
+              "--format", "bestaudio/best/worst",
+              "--concurrent-fragments", String(YTDLP_FRAGMENTS), "--retries", "3", "--fragment-retries", "5",
+              "--no-abort-on-unavailable-fragments", "--postprocessor-args", "ffmpeg:-threads 2",
+              ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
+              ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
+              "--no-mtime", "--no-playlist", "--no-progress", "--no-simulate",
+              "--print", "after_move:TRACKGRAB_FILE:%(filepath)s", "-o", pvOut, "--", url,
+            ], { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) });
+            if (pv.aborted || controller.signal.aborted || res.destroyed) return;
+            if (pv.code === 0 && !pv.signal && !pv.error && !pv.timedOut) {
+              const done2 = pv.stdout.split(/\r?\n/).filter((line) => line.startsWith("TRACKGRAB_FILE:")).map((line) => line.slice("TRACKGRAB_FILE:".length));
+              const cands2 = [...new Set([fmt.audioFormat, fmt.ext])].map((ext) => path.join(pvDir, `audio.${ext}`));
+              const p2 = cands2.find((file) => done2.some((name) => path.resolve(name) === path.resolve(file)) && fs.existsSync(file) && fs.statSync(file).size > 0);
+              if (p2) { produced = p2; isPreview = true; break; }
+            }
+            console.warn(`[download] preview-fallback failed code=${pv.code} signal=${pv.signal || "none"} ${pv.stderr || pv.error?.message || ""}`);
+          }
           return sendDownloadError(res, info);
         }
         if (!await retryDelay(DOWNLOAD_RETRY_DELAY_MS, controller.signal)) return;
@@ -580,6 +632,8 @@ app.get("/diag", (req, res) => {
     ffprobePath: ffprobeProbePath(),
     ytdlpPath: YTDLP_BIN,
     uptimeSeconds: Math.floor(process.uptime()),
+    // Region-recovery status: confirm the proxy/geo-bypass you configured is live.
+    region: { proxy: SOUNDCLOUD_PROXY ? "configured" : "none", geoBypass: GEO_BYPASS_OFF ? "off" : (GEO_BYPASS_COUNTRY || "auto"), previewFallback: true },
     downloads: { active: activeJobs, queued: jobQueue.length, concurrency: MAX_CONCURRENT, queueLimit: MAX_QUEUE, attempts: DOWNLOAD_ATTEMPTS, queueTimeoutSeconds: DOWNLOAD_QUEUE_TIMEOUT_S, shuttingDown },
     converter: convertRouter.getStatus(),
     memory: process.memoryUsage(),

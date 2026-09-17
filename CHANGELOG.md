@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.8
+
+- Region recovery: added optional outbound proxy for all SoundCloud requests (`SOUNDCLOUD_PROXY`, else `HTTPS_PROXY`/`HTTP_PROXY`). Point it at an egress in a region where the catalogue is available to recover tracks that report "unavailable in the server's region". Applies to `/info` and `/download`.
+- Enabled yt-dlp's built-in geo circumvention by default (`--geo-bypass`); set `SOUNDCLOUD_GEO_BYPASS_COUNTRY=US` to force a country or `=off` to disable. Harmless for unrestricted tracks.
+- Added a last-resort preview fallback on `/download`: when no full/available stream can be fetched (geo, Go+/DRM, preview-only, forbidden), the server retries once forcing any playable source — including the public ~30s preview snippet — with format pre-check off and unavailable fragments skipped, so a listed track still yields a labeled `(preview)` download instead of a hard failure. This does not circumvent DRM or fabricate audio SoundCloud withholds.
+- `/diag` now reports a `region` block (proxy/geoBypass/previewFallback) so the active configuration is verifiable.
+- Note: a track that is geo-blocked from the server AND has no configured allowed-region proxy, or a Go+/DRM track that exposes no public snippet, still cannot be downloaded — SoundCloud provides no fetchable audio in those cases.
+
 ## 1.3.7
 
 - Removed the application filter that discarded available preview streams. Full streams remain preferred by yt-dlp, with a clearly labeled preview download when that is the available source.
