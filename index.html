@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>TrackGrab – SoundCloud Downloader</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --brand: #FD5400;
+      --bg: #000;
+      --card: rgba(255,255,255,0.04);
+      --border: #BBBBBB;
+      --text: #fff;
+      --muted: #4A4A4A;
+      --dark-text: #363636;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 700px;
+    }
+
+    /* ── HEADER ── */
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    .header h1 {
+      font-size: clamp(36px, 7vw, 60px);
+      font-weight: 700;
+      background: linear-gradient(90deg, #fff, #aaa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      line-height: 1.1;
+      margin-bottom: 12px;
+    }
+
+    .header h1 .brand {
+      -webkit-text-fill-color: var(--brand);
+    }
+
+    .header h1 .dim {
+      -webkit-text-fill-color: #363636;
+    }
+
+    .subtitle {
+      font-size: 15px;
+      color: var(--muted);
+    }
+
+    /* ── SERVER CONFIG ── */
+    .config-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid #1f1f1f;
+      border-radius: 10px;
+      padding: 10px 16px;
+      margin-bottom: 20px;
+    }
+
+    .config-bar label {
+      font-size: 11px;
+      color: #555;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .config-bar input {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--brand);
+      font-size: 13px;
+      font-family: 'Courier New', monospace;
+    }
+
+    .config-bar input::placeholder { color: #333; }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #333;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .status-dot.online { background: #4caf50; }
+    .status-dot.offline { background: #f44336; }
+
+    /* ── FORM ── */
+    .search-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+
+    .search-row input {
+      flex: 1;
+      min-width: 220px;
+      padding: 15px 20px;
+      font-size: 15px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      color: var(--dark-text);
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .search-row input:focus { border-color: var(--brand); }
+    .search-row input::placeholder { color: #555; }
+
+    .search-row button {
+      padding: 15px 28px;
+      font-size: 15px;
+      font-weight: 600;
+      border-radius: 8px;
+      background: var(--brand);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    .search-row button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(253,84,0,0.35);
+    }
+
+    .search-row button:disabled {
+      opacity: 0.5; cursor: wait; transform: none;
+    }
+
+    /* ── SPINNER ── */
+    .spinner {
+      display: none;
+      justify-content: center;
+      align-items: flex-end;
+      gap: 4px;
+      height: 50px;
+      margin: 20px 0;
+    }
+
+    .bar {
+      width: 4px;
+      background: var(--brand);
+      border-radius: 2px;
+      animation: wave 1s infinite ease-in-out;
+    }
+
+    .bar:nth-child(1){height:20%;animation-delay:0s}
+    .bar:nth-child(2){height:40%;animation-delay:.1s}
+    .bar:nth-child(3){height:60%;animation-delay:.2s}
+    .bar:nth-child(4){height:40%;animation-delay:.3s}
+    .bar:nth-child(5){height:20%;animation-delay:.4s}
+
+    @keyframes wave {
+      0%,100%{transform:scaleY(0.4)}
+      50%{transform:scaleY(1)}
+    }
+
+    /* ── ERROR ── */
+    .error {
+      display: none;
+      background: rgba(244,67,54,0.08);
+      border: 1px solid rgba(244,67,54,0.25);
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #ef5350;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+
+    /* ── TRACK CARD ── */
+    .track-card {
+      display: none;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      animation: fadeUp 0.4s ease;
+    }
+
+    .track-inner {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+    }
+
+    .track-card img {
+      width: 120px;
+      height: 120px;
+      border-radius: 10px;
+      object-fit: cover;
+      flex-shrink: 0;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+
+    .track-placeholder {
+      width: 120px; height: 120px;
+      border-radius: 10px;
+      background: rgba(253,84,0,0.1);
+      display: flex; align-items: center;
+      justify-content: center; font-size: 36px;
+      flex-shrink: 0;
+    }
+
+    .track-meta { flex: 1; min-width: 0; }
+
+    .track-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 4px;
+      line-height: 1.3;
+    }
+
+    .track-artist {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 10px;
+    }
+
+    .track-stats {
+      display: flex;
+      gap: 14px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      font-size: 12px;
+      color: #555;
+    }
+
+    .track-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .btn-download {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 11px 20px;
+      background: var(--brand);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+
+    .btn-download:hover {
+      background: #e64d00;
+      transform: translateY(-1px);
+    }
+
+    button:disabled { opacity: .55; cursor: default; transform: none; }
+    .playlist-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+    .download-status { margin-top: 12px; color: #aaa; font-size: 13px; line-height: 1.5; }
+    .playlist-track { padding: 18px 0; border-bottom: 1px solid #333; }
+    .playlist-track .track-title { font-size: 15px; }
+    .playlist-track .track-artist { margin-bottom: 12px; }
+    .download-status.failed { color: #ef5350; }
+    .download-status.success { color: #82c785; }
+
+    .btn-cover {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 11px 20px;
+      background: rgba(255,255,255,0.06);
+      color: #aaa;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: all 0.2s;
+    }
+
+    .btn-cover:hover {
+      border-color: #555;
+      color: #fff;
+    }
+
+    .btn-reset {
+      margin-top: 16px;
+      width: 100%;
+      padding: 10px;
+      background: none;
+      border: 1px solid #1f1f1f;
+      border-radius: 8px;
+      color: #444;
+      font-size: 13px;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: all 0.2s;
+    }
+
+    .btn-reset:hover { border-color: #333; color: #888; }
+
+    /* ── FOOTER ── */
+    .footer {
+      text-align: center;
+      margin-top: 30px;
+      font-size: 11px;
+      color: #222;
+      letter-spacing: 1px;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(14px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 500px) {
+      .track-inner { flex-direction: column; align-items: center; text-align: center; }
+      .track-stats { justify-content: center; }
+      .track-actions { justify-content: center; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <h1><span class="brand">SoundCloud</span> <span class="dim">to MP3</span></h1>
+    <p class="subtitle">Paste a SoundCloud track or playlist link and download available audio as MP3</p>
+  </div>
+
+  <!-- Server config -->
+  <div class="config-bar">
+    <span class="status-dot" id="statusDot"></span>
+    <label>YOUR SERVER →</label>
+    <input type="text" id="serverInput"
+      placeholder="https://your-app.onrender.com"
+      oninput="saveServer()" />
+  </div>
+
+  <!-- Search -->
+  <div class="search-row">
+    <input type="text" id="urlInput"
+      placeholder="https://soundcloud.com/artist/track-name"
+      onkeydown="if(event.key==='Enter') fetchInfo()" />
+    <button id="fetchBtn" onclick="fetchInfo()">Get Tracks</button>
+  </div>
+
+  <!-- Error -->
+  <div class="error" id="errorBox" role="alert"></div>
+
+  <!-- Spinner -->
+  <div class="spinner" id="spinner">
+    <div class="bar"></div><div class="bar"></div>
+    <div class="bar"></div><div class="bar"></div>
+    <div class="bar"></div>
+  </div>
+
+  <!-- Track result -->
+  <div class="track-card" id="trackCard">
+    <div class="track-inner">
+      <div id="artworkWrap"></div>
+      <div class="track-meta">
+        <div class="track-title" id="trackTitle"></div>
+        <div class="track-artist" id="trackArtist"></div>
+        <div class="track-stats" id="trackStats"></div>
+        <div class="track-actions" id="trackActions"></div>
+      </div>
+    </div>
+    <div id="playlistToolbar" class="playlist-toolbar"></div>
+    <div id="downloadStatus" class="download-status" role="status" aria-live="polite"></div>
+    <div id="playlistTracks"></div>
+    <button class="btn-reset" onclick="reset()">← Search another track</button>
+  </div>
+
+  <p class="footer">POWERED BY YOUR OWN SERVER · PERSONAL USE ONLY</p>
+</div>
+
+<script>
+  const SERVER_KEY = 'trackgrab_server';
+  let currentTrack = null;
+  let activeDownloads = null;
+  let playlistRows = [];
+
+  class DownloadError extends Error {
+    constructor(message, details = {}) {
+      super(message);
+      this.code = details.code || details.category || '';
+      this.retryable = details.retryable === true;
+      this.retryAfterSeconds = Math.min(60, Math.max(1, Number(details.retryAfterSeconds) || 3));
+    }
+  }
+
+  function soundCloudUrl(value) {
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === 'https:' &&
+        (parsed.hostname === 'soundcloud.com' || parsed.hostname.endsWith('.soundcloud.com'));
+    } catch { return false; }
+  }
+
+  async function responseError(res) {
+    let data = {};
+    try { data = await res.json(); } catch {}
+    const code = data.code || data.category || '';
+    const messages = {
+      bad_link: 'This download link has expired. Search for the track again.',
+      unauthorized: 'This server requires an authorized connection.',
+      unavailable: 'SoundCloud does not provide full audio for this track.',
+      premium: 'This track requires a SoundCloud subscription and is unavailable for download.',
+      private: 'This track is private or access is restricted.',
+      geo: 'This track is unavailable in the server’s region.',
+      ratelimit: 'SoundCloud is temporarily limiting downloads. Please try again later.',
+      rate_limited: 'SoundCloud is temporarily limiting downloads. Please try again later.',
+      'queue-full': 'The download service is busy. Please try again shortly.',
+      server_busy: 'The download service is busy. Please try again shortly.',
+      timeout: 'Preparing the audio took too long. Please try again.'
+    };
+    let message = messages[code];
+    if (!message && res.status === 401) message = 'This server requires an authorized connection.';
+    if (!message && (res.status === 429 || res.status === 503)) message = 'The download service is busy. Please try again shortly.';
+    if (!message && res.status === 403) message = 'Access to this track or download link is restricted. Search for the track again.';
+    // Older servers send maintenance advice; end users need a safe explanation.
+    if (!message && typeof data.error === 'string' &&
+        !/yt-dlp|ffmpeg|ffprobe|pm2|PATH|install|logs|conversion failed|download failed/i.test(data.error)) {
+      message = data.error;
+    }
+    return new DownloadError(message || 'The service could not prepare this audio. Please try again later.', {
+      code,
+      retryable: data.retryable,
+      retryAfterSeconds: data.retryAfterSeconds || res.headers.get('Retry-After')
+    });
+  }
+
+  function errorMessage(error) {
+    if (error.name === 'AbortError') return 'Download stopped.';
+    if (error instanceof DownloadError) return error.message;
+    return 'Could not reach the download service. Check your connection and try again.';
+  }
+
+  window.addEventListener('DOMContentLoaded', () => {
+    const saved = localStorage.getItem(SERVER_KEY);
+    if (saved) {
+      document.getElementById('serverInput').value = saved;
+      checkServer(saved);
+    }
+  });
+
+  function saveServer() {
+    const val = document.getElementById('serverInput').value.trim();
+    localStorage.setItem(SERVER_KEY, val);
+    if (val) checkServer(val);
+  }
+
+  async function checkServer(url) {
+    const dot = document.getElementById('statusDot');
+    dot.className = 'status-dot';
+    try {
+      const res = await fetch(url.replace(/\/$/, '') + '/');
+      dot.className = res.ok ? 'status-dot online' : 'status-dot offline';
+    } catch { dot.className = 'status-dot offline'; }
+  }
+
+  function getServer() {
+    return document.getElementById('serverInput').value.trim().replace(/\/$/, '');
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('errorBox');
+    el.textContent = '⚠ ' + msg;
+    el.style.display = 'block';
+  }
+
+  function hideError() {
+    document.getElementById('errorBox').style.display = 'none';
+  }
+
+  function setLoading(on) {
+    document.getElementById('spinner').style.display = on ? 'flex' : 'none';
+    document.getElementById('fetchBtn').disabled = on;
+    document.getElementById('fetchBtn').textContent = on ? 'Fetching...' : 'Get Tracks';
+  }
+
+  async function fetchInfo() {
+    if (activeDownloads) return;
+    const server = getServer();
+    const url = document.getElementById('urlInput').value.trim();
+    hideError();
+    document.getElementById('trackCard').style.display = 'none';
+    if (!server) { showError('Please enter your server URL first.'); return; }
+    if (!url) { showError('Please paste a SoundCloud track or playlist URL.'); return; }
+    if (!soundCloudUrl(url)) { showError('Please enter a valid HTTPS SoundCloud URL.'); return; }
+    setLoading(true);
+    try {
+      const res = await fetch(server + '/info?url=' + encodeURIComponent(url));
+      if (!res.ok) throw await responseError(res);
+      const data = await res.json();
+      if (data.error) throw new DownloadError(data.error, data);
+      currentTrack = data;
+      renderTrack(data, server, url);
+    } catch (error) { showError(errorMessage(error)); }
+    finally { setLoading(false); }
+  }
+
+  function makeButton(text, className, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = text;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  function renderTrack(track, server, originalUrl) {
+    const isPlaylist = track.type === 'playlist' && Array.isArray(track.tracks);
+    const header = isPlaylist ? track.header || {} : track;
+    const title = isPlaylist ? header.playlist_title || 'Playlist' : track.title || 'Track';
+    const thumbnail = header.thumbnail;
+    const artWrap = document.getElementById('artworkWrap');
+    artWrap.replaceChildren();
+    if (thumbnail && /^https?:\/\//i.test(thumbnail)) {
+      const artwork = document.createElement('img');
+      artwork.src = thumbnail;
+      artwork.alt = 'Cover artwork';
+      artWrap.append(artwork);
+    } else {
+      const placeholder = document.createElement('div');
+      placeholder.className = 'track-placeholder';
+      placeholder.textContent = '♪';
+      artWrap.append(placeholder);
+    }
+    document.getElementById('trackTitle').textContent = title;
+    document.getElementById('trackArtist').textContent = header.uploader || '';
+    const stats = document.getElementById('trackStats');
+    stats.replaceChildren();
+    const values = [
+      track.duration ? formatDuration(track.duration) : '',
+      track.view_count ? '▶ ' + track.view_count.toLocaleString() : '',
+      track.like_count ? '♥ ' + track.like_count.toLocaleString() : ''
+    ];
+    for (const value of values.filter(Boolean)) {
+      const stat = document.createElement('span');
+      stat.className = 'stat';
+      stat.textContent = value;
+      stats.append(stat);
+    }
+    const actions = document.getElementById('trackActions');
+    actions.replaceChildren();
+    const toolbar = document.getElementById('playlistToolbar');
+    toolbar.replaceChildren();
+    const rows = document.getElementById('playlistTracks');
+    rows.replaceChildren();
+    document.getElementById('downloadStatus').textContent = '';
+    playlistRows = [];
+    if (isPlaylist) {
+      stats.textContent = track.tracks.length + ' listed tracks';
+      const all = makeButton('Download all available MP3s', 'btn-download', () => downloadAll(server));
+      all.id = 'downloadAll';
+      all.disabled = !track.tracks.length;
+      toolbar.append(all);
+      document.getElementById('downloadStatus').textContent =
+        'Tracks download one at a time. Allow multiple downloads if your browser asks. Unavailable tracks will be reported and skipped.';
+      for (const item of track.tracks) {
+        const row = document.createElement('div');
+        row.className = 'playlist-track';
+        const name = document.createElement('div');
+        name.className = 'track-title';
+        name.textContent = item.title || 'Untitled track';
+        const artist = document.createElement('div');
+        artist.className = 'track-artist';
+        artist.textContent = item.uploader || '';
+        const status = document.createElement('div');
+        status.className = 'download-status';
+        status.setAttribute('role', 'status');
+        const button = makeButton('Download MP3', 'btn-download', () => downloadOne(server, item, status));
+        if (item.available === false || !soundCloudUrl(item.url)) {
+          button.disabled = true;
+          status.textContent = 'Full audio is unavailable for this track.';
+        }
+        row.append(name, artist, button, status);
+        rows.append(row);
+        playlistRows.push({ item, button, status, available: !button.disabled });
+      }
+      all.disabled = !playlistRows.some(row => row.available);
+    } else {
+      const item = { ...track, title, url: originalUrl };
+      actions.append(makeButton('Download MP3', 'btn-download',
+        () => downloadOne(server, item, document.getElementById('downloadStatus'))));
+    }
+    if (thumbnail) actions.append(makeButton('Save Cover', 'btn-cover', () => downloadCover(thumbnail, title)));
+    const stop = makeButton('Stop', 'btn-cover', () => activeDownloads && activeDownloads.abort());
+    stop.id = 'stopDownloads';
+    stop.hidden = true;
+    toolbar.append(stop);
+    document.getElementById('trackCard').style.display = 'block';
+  }
+
+  function lockDownloads(locked) {
+    for (const id of ['fetchBtn', 'serverInput', 'urlInput']) document.getElementById(id).disabled = locked;
+    document.querySelectorAll('#trackCard button').forEach(button => {
+      if (button.id !== 'stopDownloads') button.disabled = locked;
+    });
+    if (!locked) {
+      playlistRows.forEach(row => { row.button.disabled = !row.available; });
+      const all = document.getElementById('downloadAll');
+      if (all) all.disabled = !playlistRows.some(row => row.available);
+    }
+    const stop = document.getElementById('stopDownloads');
+    if (stop) stop.hidden = !locked;
+  }
+
+  function safeFilename(title) {
+    return String(title || 'track').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '').trim().slice(0, 180) || 'track';
+  }
+
+  function saveBlob(blob, filename) {
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    // The browser consumes this after the current event handler finishes.
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+  }
+
+  function waitForRetry(seconds, signal) {
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('Stopped', 'AbortError'));
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      }, seconds * 1000);
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    });
+  }
+
+  async function prepareDownload(server, item, status, signal) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (signal.aborted) throw new DOMException('Stopped', 'AbortError');
+        status.className = 'download-status';
+        status.textContent = 'Preparing MP3…';
+        const params = new URLSearchParams({ url: item.url, title: item.title || 'track', format: 'mp3' });
+        const res = await fetch(server + '/download?' + params, { signal });
+        if (!res.ok) throw await responseError(res);
+        const contentType = String(res.headers.get('Content-Type') || '').toLowerCase();
+        if (!/^(audio\/|application\/octet-stream)/.test(contentType)) {
+          throw new DownloadError('The service returned an unexpected file. Please try again later.');
+        }
+        const blob = await res.blob();
+        if (!blob.size) throw new DownloadError('The service returned an empty audio file. Please try again.');
+        if (signal.aborted) throw new DOMException('Stopped', 'AbortError');
+        const isPreview = res.headers.get('X-TrackGrab-Preview') === '1';
+        saveBlob(blob, safeFilename(item.title) + (isPreview ? ' (preview)' : '') + '.mp3');
+        status.className = 'download-status success';
+        status.textContent = isPreview
+          ? 'Preview MP3 sent to your browser. SoundCloud only provides a preview of this track.'
+          : 'MP3 sent to your browser. Check your downloads.';
+        return;
+      } catch (error) {
+        if (attempt === 0 && error.retryable && !signal.aborted) {
+          status.textContent = 'Temporarily busy. Retrying in ' + error.retryAfterSeconds + ' seconds…';
+          await waitForRetry(error.retryAfterSeconds, signal);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  async function downloadOne(server, item, status) {
+    if (activeDownloads) return;
+    hideError();
+    const controller = new AbortController();
+    activeDownloads = controller;
+    lockDownloads(true);
+    try { await prepareDownload(server, item, status, controller.signal); }
+    catch (error) {
+      status.className = 'download-status failed';
+      status.textContent = errorMessage(error);
+    } finally {
+      activeDownloads = null;
+      lockDownloads(false);
+    }
+  }
+
+  async function downloadAll(server) {
+    if (activeDownloads) return;
+    hideError();
+    const controller = new AbortController();
+    activeDownloads = controller;
+    lockDownloads(true);
+    const summary = document.getElementById('downloadStatus');
+    const available = playlistRows.filter(row => row.available);
+    const unavailable = playlistRows.length - available.length;
+    let sent = 0, failed = 0, attempted = 0;
+    try {
+      for (const row of available) {
+        if (controller.signal.aborted) break;
+        summary.textContent = 'Preparing track ' + (attempted + 1) + ' of ' + available.length +
+          '. ' + sent + ' MP3s sent to your browser.';
+        try {
+          await prepareDownload(server, row.item, row.status, controller.signal);
+          sent++;
+          attempted++;
+        } catch (error) {
+          row.status.className = 'download-status failed';
+          row.status.textContent = errorMessage(error);
+          if (error.name === 'AbortError' || controller.signal.aborted) break;
+          failed++;
+          attempted++;
+        }
+      }
+    } finally {
+      const remaining = available.length - attempted;
+      summary.textContent = (controller.signal.aborted ? 'Stopped. ' : 'Finished. ') +
+        sent + ' MP3s sent to your browser; ' + failed + ' failed; ' + unavailable + ' unavailable' +
+        (remaining ? '; ' + remaining + ' not completed' : '') +
+        '. Check browser downloads and allow multiple files if prompted.';
+      activeDownloads = null;
+      lockDownloads(false);
+    }
+  }
+
+  function formatDuration(secs) {
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  async function downloadCover(url, title) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Cover unavailable');
+      const blob = await res.blob();
+      saveBlob(blob, safeFilename(title) + '.jpg');
+    } catch { showError('Could not download the cover image.'); }
+  }
+
+  function reset() {
+    if (activeDownloads) return;
+    document.getElementById('urlInput').value = '';
+    document.getElementById('trackCard').style.display = 'none';
+    hideError();
+    currentTrack = null;
+    document.getElementById('urlInput').focus();
+  }
+</script>
+</body>
+</html>
