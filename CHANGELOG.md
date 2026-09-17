@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.1
+
+- Personalized/"related tracks" discover sets now resolve. For URLs like `/discover/sets/personalized-tracks::<user>:<seedTrackId>` (which 404 on `/resolve`), the backend reads the trailing seed track id and builds the set from that track's public `tracks/{id}/related` recommendations (plus the seed) — the same anonymous, client_id path SoundCloud's web player and web downloaders use. Tracks then download through the normal yt-dlp path.
+
 ## 1.4.0
 
 - Added a SoundCloud api-v2 `/resolve` fallback on `/info`, used only when yt-dlp cannot read a URL. This handles "system"/personalized/discover set URLs (e.g. `/discover/sets/personalized-tracks::user:token`) that the yt-dlp set extractor 404s on — the same anonymous, public-`client_id` path SoundCloud's own web player (and web-based downloaders) use. No login required. The backend scrapes a `client_id`, calls `/resolve`, and batch-hydrates id-only system-playlist entries via `/tracks`. Resolved tracks then download through the normal yt-dlp path (proxy/geo/preview all still apply).

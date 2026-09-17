@@ -196,44 +196,80 @@ async function scApiJson(url, signal) {
   if (!r.ok) throw new Error("api_" + r.status);
   return r.json();
 }
+// Build a "related tracks" playlist from a seed track id — SoundCloud's public
+// recommendation endpoint (the same source its web player uses for personalized/
+// discover sets). Works with an anonymous client_id, so it succeeds where
+// /resolve 404s on these "system playlist" URLs.
+async function scRelatedFromSeed(seedId, cid, signal) {
+  const list = [];
+  const seed = await scApiJson(`https://api-v2.soundcloud.com/tracks/${seedId}?client_id=${cid}`, signal).catch(() => null);
+  if (seed && seed.permalink_url) list.push(scMapTrack(seed));
+  const rel = await scApiJson(`https://api-v2.soundcloud.com/tracks/${seedId}/related?client_id=${cid}&limit=50`, signal).catch(() => null);
+  const relTracks = rel && Array.isArray(rel.collection) ? rel.collection : (Array.isArray(rel) ? rel : []);
+  for (const t of relTracks) if (t && t.permalink_url) list.push(scMapTrack(t));
+  return list;
+}
+
 // Resolve a set/track URL via api-v2. Returns {tracks:[...]} for a playlist or
 // {single:{...}} for a track, or throws.
 async function scResolve(url, signal) {
-  let cid = await scGetClientId(signal, false);
-  let data;
-  try {
-    data = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${cid}`, signal);
-  } catch (e) {
-    if (String(e.message).startsWith("api_")) { cid = await scGetClientId(signal, true); data = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${cid}`, signal); }
-    else throw e;
+  const cid = await scGetClientId(signal, false);
+  const resolveOnce = (c) => scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${c}`, signal);
+  let data = null;
+  try { data = await resolveOnce(cid); }
+  catch (e) {
+    if (String(e.message) === "api_401" || String(e.message) === "api_403") {
+      try { data = await resolveOnce(await scGetClientId(signal, true)); } catch (_) {}
+    }
+    // Any other status (e.g. 404 for a system/personalized set) falls through
+    // to the seed-based fallback below.
   }
-  const kind = data && data.kind;
-  if (kind === "track") return { single: scMapTrack(data) };
-  if (kind !== "playlist" && kind !== "system-playlist") throw new Error("not_playlist");
-  const raw = Array.isArray(data.tracks) ? data.tracks : [];
-  const ready = [];
-  const needIds = [];
-  for (const t of raw) {
-    if (t && t.permalink_url && t.title) ready.push(scMapTrack(t));
-    else if (t && t.id) needIds.push(t.id);
+  if (data) {
+    if (data.kind === "track") return { single: scMapTrack(data) };
+    if (data.kind === "playlist" || data.kind === "system-playlist") {
+      const raw = Array.isArray(data.tracks) ? data.tracks : [];
+      const ready = [];
+      const needIds = [];
+      for (const t of raw) {
+        if (t && t.permalink_url && t.title) ready.push(scMapTrack(t));
+        else if (t && t.id) needIds.push(t.id);
+      }
+      for (let i = 0; i < needIds.length && i < 500; i += 50) {
+        const batch = needIds.slice(i, i + 50);
+        try {
+          const arr = await scApiJson(`https://api-v2.soundcloud.com/tracks?ids=${batch.join(",")}&client_id=${cid}`, signal);
+          if (Array.isArray(arr)) for (const tr of arr) if (tr && tr.permalink_url) ready.push(scMapTrack(tr));
+        } catch (_) {}
+      }
+      if (ready.length) return {
+        header: {
+          playlist_title: data.title || "Playlist",
+          uploader: (data.user && data.user.username) || "",
+          uploader_url: (data.user && data.user.permalink_url) || "",
+          thumbnail: data.artwork_url || (ready[0] && ready[0].thumbnail) || "",
+        },
+        total: ready.length, tracks: ready,
+      };
+    }
   }
-  for (let i = 0; i < needIds.length && i < 500; i += 50) {
-    const batch = needIds.slice(i, i + 50);
-    try {
-      const arr = await scApiJson(`https://api-v2.soundcloud.com/tracks?ids=${batch.join(",")}&client_id=${cid}`, signal);
-      if (Array.isArray(arr)) for (const tr of arr) if (tr && tr.permalink_url) ready.push(scMapTrack(tr));
-    } catch (_) {}
+  // Personalized / "related tracks" discover set, e.g.
+  //   /discover/sets/personalized-tracks::<user>:<seedTrackId>
+  // These 404 on /resolve; the trailing id is the seed track. Build the set from
+  // that track's public "related" recommendations (what songverter does too).
+  const seedMatch = url.match(/personalized-tracks::[^:/?#]+:(\d+)/) || url.match(/track-stations:(\d+)/);
+  if (seedMatch) {
+    const tracks = await scRelatedFromSeed(seedMatch[1], cid, signal);
+    if (tracks.length) return {
+      header: {
+        playlist_title: `Related tracks: ${tracks[0].title}`,
+        uploader: tracks[0].uploader || "",
+        uploader_url: "",
+        thumbnail: tracks[0].thumbnail || "",
+      },
+      total: tracks.length, tracks,
+    };
   }
-  return {
-    header: {
-      playlist_title: data.title || "Playlist",
-      uploader: (data.user && data.user.username) || "",
-      uploader_url: (data.user && data.user.permalink_url) || "",
-      thumbnail: data.artwork_url || (ready[0] && ready[0].thumbnail) || "",
-    },
-    total: ready.length,
-    tracks: ready,
-  };
+  throw new Error("not_resolvable");
 }
 
 function soundCloudArgs() {
