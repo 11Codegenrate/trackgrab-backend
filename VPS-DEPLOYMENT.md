@@ -59,6 +59,17 @@ Diagnostics must report `"version":"1.3.7"` and `ytdlp.ok`, `ffmpeg.ok`, and `ff
 | PM2 `kill_timeout` | `960000` ms | Allows application shutdown grace to finish |
 | `SOUNDCLOUD_PROXY` | _(none)_ | Route all SoundCloud requests through this proxy URL. Set it to an egress in a region where the catalogue is available to recover "unavailable in the server's region" tracks. Falls back to `HTTPS_PROXY`/`HTTP_PROXY` if unset. |
 | `SOUNDCLOUD_GEO_BYPASS_COUNTRY` | _(auto)_ | Force yt-dlp geo-bypass to a country code (e.g. `US`, `GB`, `DE`). Leave unset for automatic `--geo-bypass`; set `off` to disable it entirely. |
+| `SOUNDCLOUD_COOKIES` | _(none)_ | Path to a Netscape `cookies.txt` exported from a browser logged into SoundCloud. Enables fetching private/unlisted tracks and personalized "discover" sets the account is entitled to. |
+| `SOUNDCLOUD_OAUTH_TOKEN` | _(none)_ | Alternative to a cookies file: the `oauth_token` cookie value from a logged-in SoundCloud session. A minimal cookies file is generated from it. Ignored if `SOUNDCLOUD_COOKIES` is set. |
+
+### SoundCloud login for private / personalized sets (1.3.9)
+
+Public tracks and playlists never need this. But personalized "discover" sets (e.g. `/discover/sets/personalized-tracks::user:token`) and private/unlisted tracks return **404** to anonymous requests — they need a logged-in SoundCloud session. Provide one of:
+
+- **Cookies file (recommended):** in a browser logged into SoundCloud, export `cookies.txt` (a "Get cookies.txt" extension), upload it to the VPS (e.g. `/opt/trackgrab/sc-cookies.txt`, `chmod 600`), then set `SOUNDCLOUD_COOKIES=/opt/trackgrab/sc-cookies.txt`.
+- **OAuth token:** copy the `oauth_token` cookie value (DevTools → Application → Cookies → soundcloud.com → `oauth_token`) and set `SOUNDCLOUD_OAUTH_TOKEN=<value>`.
+
+Confirm at `/diag` → `region.auth` shows `cookies` or `oauth`. Cookies expire; re-export if authenticated fetches start failing.
 
 ### Region recovery (1.3.8) — download every listed track
 

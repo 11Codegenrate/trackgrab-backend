@@ -168,6 +168,8 @@ function soundCloudArgs() {
     if (GEO_BYPASS_COUNTRY) args.push("--geo-bypass-country", GEO_BYPASS_COUNTRY);
     else args.push("--geo-bypass");
   }
+  // Authenticated requests (private/unlisted tracks + personalized discover sets).
+  if (SOUNDCLOUD_COOKIE_FILE) args.push("--cookies", SOUNDCLOUD_COOKIE_FILE);
   return args;
 }
 
@@ -257,6 +259,32 @@ const SOUNDCLOUD_PROXY = String(process.env.SOUNDCLOUD_PROXY || process.env.HTTP
 // SOUNDCLOUD_GEO_BYPASS_COUNTRY=US (etc.) to force a country, or =off to disable.
 const GEO_BYPASS_COUNTRY = String(process.env.SOUNDCLOUD_GEO_BYPASS_COUNTRY || "").trim().toUpperCase();
 const GEO_BYPASS_OFF = GEO_BYPASS_COUNTRY === "OFF" || GEO_BYPASS_COUNTRY === "0" || GEO_BYPASS_COUNTRY === "NONE";
+// Optional SoundCloud authentication so the backend can fetch content the account
+// is entitled to — private/unlisted tracks and personalized "discover" sets
+// (e.g. .../discover/sets/personalized-tracks::user:token) that SoundCloud returns
+// 404 for when unauthenticated. Provide EITHER a full Netscape cookies.txt exported
+// from a logged-in browser (SOUNDCLOUD_COOKIES=/path), OR just the oauth_token cookie
+// value (SOUNDCLOUD_OAUTH_TOKEN=...), from which we materialize a minimal cookies file
+// that yt-dlp reads. Nothing is sent anywhere except SoundCloud via yt-dlp.
+const SOUNDCLOUD_COOKIES = String(process.env.SOUNDCLOUD_COOKIES || "").trim();
+const SOUNDCLOUD_OAUTH_TOKEN = String(process.env.SOUNDCLOUD_OAUTH_TOKEN || "").trim();
+let SOUNDCLOUD_COOKIE_FILE = "";
+(function resolveSoundcloudCookies() {
+  if (SOUNDCLOUD_COOKIES) {
+    if (fs.existsSync(SOUNDCLOUD_COOKIES)) SOUNDCLOUD_COOKIE_FILE = SOUNDCLOUD_COOKIES;
+    else console.warn(`[auth] SOUNDCLOUD_COOKIES path not found: ${SOUNDCLOUD_COOKIES}`);
+    return;
+  }
+  if (SOUNDCLOUD_OAUTH_TOKEN) {
+    try {
+      const file = path.join(os.tmpdir(), "sc-oauth-cookies.txt");
+      const expiry = Math.floor(Date.now() / 1000) + 400 * 24 * 3600;
+      // Netscape cookie format: domain, subdomains, path, secure, expiry, name, value.
+      fs.writeFileSync(file, `# Netscape HTTP Cookie File\n.soundcloud.com\tTRUE\t/\tTRUE\t${expiry}\toauth_token\t${SOUNDCLOUD_OAUTH_TOKEN}\n`, { mode: 0o600 });
+      SOUNDCLOUD_COOKIE_FILE = file;
+    } catch (error) { console.warn("[auth] could not write oauth cookie file:", error.message); }
+  }
+})();
 
 // Clamp a requested MP3 bitrate to a sane CBR value; "" means "let yt-dlp pick best".
 function normalizeBitrate(raw) {
@@ -633,7 +661,7 @@ app.get("/diag", (req, res) => {
     ytdlpPath: YTDLP_BIN,
     uptimeSeconds: Math.floor(process.uptime()),
     // Region-recovery status: confirm the proxy/geo-bypass you configured is live.
-    region: { proxy: SOUNDCLOUD_PROXY ? "configured" : "none", geoBypass: GEO_BYPASS_OFF ? "off" : (GEO_BYPASS_COUNTRY || "auto"), previewFallback: true },
+    region: { proxy: SOUNDCLOUD_PROXY ? "configured" : "none", geoBypass: GEO_BYPASS_OFF ? "off" : (GEO_BYPASS_COUNTRY || "auto"), previewFallback: true, auth: SOUNDCLOUD_COOKIE_FILE ? (SOUNDCLOUD_COOKIES ? "cookies" : "oauth") : "none" },
     downloads: { active: activeJobs, queued: jobQueue.length, concurrency: MAX_CONCURRENT, queueLimit: MAX_QUEUE, attempts: DOWNLOAD_ATTEMPTS, queueTimeoutSeconds: DOWNLOAD_QUEUE_TIMEOUT_S, shuttingDown },
     converter: convertRouter.getStatus(),
     memory: process.memoryUsage(),

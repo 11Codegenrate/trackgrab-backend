@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.9
+
+- Optional SoundCloud authentication so the backend can fetch content the account is entitled to: private/unlisted tracks and personalized "discover" sets (e.g. `/discover/sets/personalized-tracks::user:token`) that SoundCloud returns 404 for when unauthenticated. Set `SOUNDCLOUD_COOKIES=/path/to/cookies.txt` (full Netscape cookies exported from a logged-in browser) or just `SOUNDCLOUD_OAUTH_TOKEN=<oauth_token cookie value>` (a minimal cookies file is materialized). Passed to yt-dlp via `--cookies` on `/info` and `/download`.
+- `/diag` `region` block adds `auth` (`cookies`/`oauth`/`none`).
+- Note: personalized/system "discover" sets are only fetchable with a valid session for the owning account; a normal public track/playlist never needs this.
+
 ## 1.3.8
 
 - Region recovery: added optional outbound proxy for all SoundCloud requests (`SOUNDCLOUD_PROXY`, else `HTTPS_PROXY`/`HTTP_PROXY`). Point it at an egress in a region where the catalogue is available to recover tracks that report "unavailable in the server's region". Applies to `/info` and `/download`.
