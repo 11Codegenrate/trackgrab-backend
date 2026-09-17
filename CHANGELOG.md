@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+- Added a SoundCloud api-v2 `/resolve` fallback on `/info`, used only when yt-dlp cannot read a URL. This handles "system"/personalized/discover set URLs (e.g. `/discover/sets/personalized-tracks::user:token`) that the yt-dlp set extractor 404s on — the same anonymous, public-`client_id` path SoundCloud's own web player (and web-based downloaders) use. No login required. The backend scrapes a `client_id`, calls `/resolve`, and batch-hydrates id-only system-playlist entries via `/tracks`. Resolved tracks then download through the normal yt-dlp path (proxy/geo/preview all still apply).
+- Normal public tracks and playlists are unaffected — they still resolve through yt-dlp; the fallback only runs on failure.
+- If a `client_id` request is rejected (401/403) it is re-scraped once.
+
 ## 1.3.9
 
 - Optional SoundCloud authentication so the backend can fetch content the account is entitled to: private/unlisted tracks and personalized "discover" sets (e.g. `/discover/sets/personalized-tracks::user:token`) that SoundCloud returns 404 for when unauthenticated. Set `SOUNDCLOUD_COOKIES=/path/to/cookies.txt` (full Netscape cookies exported from a logged-in browser) or just `SOUNDCLOUD_OAUTH_TOKEN=<oauth_token cookie value>` (a minimal cookies file is materialized). Passed to yt-dlp via `--cookies` on `/info` and `/download`.

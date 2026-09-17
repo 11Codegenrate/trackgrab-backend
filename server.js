@@ -156,6 +156,86 @@ function validSoundCloudUrl(value) {
   } catch (_) { return false; }
 }
 
+// ── SoundCloud api-v2 resolve fallback ──────────────────────────────────────
+// yt-dlp's set extractor 404s on SoundCloud "system"/personalized/discover set
+// URLs (e.g. /discover/sets/personalized-tracks::user:token). SoundCloud's own web
+// player resolves these anonymously with a public client_id via api-v2 — no login.
+// We mirror that only as a fallback (normal tracks/playlists still go through
+// yt-dlp): scrape a client_id, call /resolve, and hydrate id-only system-playlist
+// entries. Uses the same public web API the site itself calls.
+let scCachedClientId = "";
+function scHeaders() {
+  return { "User-Agent": `Mozilla/5.0 (compatible; ScloudTrackGrab/${BACKEND_VERSION})`, "Accept": "application/json, text/javascript, */*" };
+}
+async function scGetClientId(signal, force) {
+  if (scCachedClientId && !force) return scCachedClientId;
+  const home = await (await fetch("https://soundcloud.com/", { headers: scHeaders(), signal })).text();
+  const scripts = [...home.matchAll(/<script[^>]+src="([^"]+\.js[^"]*)"/g)].map((m) => m[1]);
+  // The client_id lives in one of the app bundles; the later ones are likeliest.
+  for (const src of scripts.reverse()) {
+    try {
+      const js = await (await fetch(src, { headers: scHeaders(), signal })).text();
+      const m = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{22,})"/);
+      if (m) { scCachedClientId = m[1]; return scCachedClientId; }
+    } catch (_) {}
+  }
+  throw new Error("client_id_not_found");
+}
+function scMapTrack(t) {
+  return {
+    title: t.title || titleFromUrl(t.permalink_url || ""),
+    url: t.permalink_url || "",
+    uploader: (t.user && t.user.username) || t.publisher_metadata?.artist || "",
+    duration: typeof t.duration === "number" ? Math.round(t.duration / 1000) : null,
+    thumbnail: t.artwork_url || (t.user && t.user.avatar_url) || "",
+  };
+}
+async function scApiJson(url, signal) {
+  const r = await fetch(url, { headers: scHeaders(), signal });
+  if (r.status === 401 || r.status === 403) { scCachedClientId = ""; }
+  if (!r.ok) throw new Error("api_" + r.status);
+  return r.json();
+}
+// Resolve a set/track URL via api-v2. Returns {tracks:[...]} for a playlist or
+// {single:{...}} for a track, or throws.
+async function scResolve(url, signal) {
+  let cid = await scGetClientId(signal, false);
+  let data;
+  try {
+    data = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${cid}`, signal);
+  } catch (e) {
+    if (String(e.message).startsWith("api_")) { cid = await scGetClientId(signal, true); data = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${cid}`, signal); }
+    else throw e;
+  }
+  const kind = data && data.kind;
+  if (kind === "track") return { single: scMapTrack(data) };
+  if (kind !== "playlist" && kind !== "system-playlist") throw new Error("not_playlist");
+  const raw = Array.isArray(data.tracks) ? data.tracks : [];
+  const ready = [];
+  const needIds = [];
+  for (const t of raw) {
+    if (t && t.permalink_url && t.title) ready.push(scMapTrack(t));
+    else if (t && t.id) needIds.push(t.id);
+  }
+  for (let i = 0; i < needIds.length && i < 500; i += 50) {
+    const batch = needIds.slice(i, i + 50);
+    try {
+      const arr = await scApiJson(`https://api-v2.soundcloud.com/tracks?ids=${batch.join(",")}&client_id=${cid}`, signal);
+      if (Array.isArray(arr)) for (const tr of arr) if (tr && tr.permalink_url) ready.push(scMapTrack(tr));
+    } catch (_) {}
+  }
+  return {
+    header: {
+      playlist_title: data.title || "Playlist",
+      uploader: (data.user && data.user.username) || "",
+      uploader_url: (data.user && data.user.permalink_url) || "",
+      thumbnail: data.artwork_url || (ready[0] && ready[0].thumbnail) || "",
+    },
+    total: ready.length,
+    tracks: ready,
+  };
+}
+
 function soundCloudArgs() {
   // Explicitly try every format supported by the extractor. MP3 output does not
   // require an MP3 source; AAC/Opus are converted by FFmpeg. Local yt-dlp config
@@ -199,6 +279,19 @@ app.get("/info", async (req, res) => {
       const info = classifyDownloadError(result.stderr, result);
       if (!info.retryable || attempt === 1) {
         console.error(`[info] code=${result.code} signal=${result.signal || "none"} ${result.stderr || result.error?.message || info.code}`);
+        // Fallback: SoundCloud api-v2 resolve for system/personalized/discover sets
+        // (and unlisted items) the yt-dlp set extractor can't read. No login needed.
+        try {
+          const r = await scResolve(url, controller.signal);
+          if (controller.signal.aborted || res.writableEnded) return;
+          if (r && r.tracks && r.tracks.length) {
+            return res.json({ type: "playlist", header: r.header, total: r.total, tracks: r.tracks });
+          }
+          if (r && r.single && r.single.url) {
+            const t = r.single;
+            return res.json({ title: t.title, uploader: t.uploader, thumbnail: t.thumbnail, duration: t.duration, url: t.url, preview_only: null });
+          }
+        } catch (fallbackErr) { console.warn("[info] resolve fallback failed:", fallbackErr.message); }
         return sendDownloadError(res, info);
       }
       if (!await retryDelay(DOWNLOAD_RETRY_DELAY_MS, controller.signal)) return;
