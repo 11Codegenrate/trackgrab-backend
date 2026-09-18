@@ -164,17 +164,34 @@ function validSoundCloudUrl(value) {
 // yt-dlp): scrape a client_id, call /resolve, and hydrate id-only system-playlist
 // entries. Uses the same public web API the site itself calls.
 let scCachedClientId = "";
-function scHeaders() {
-  return { "User-Agent": `Mozilla/5.0 (compatible; ScloudTrackGrab/${BACKEND_VERSION})`, "Accept": "application/json, text/javascript, */*" };
+// ALL SoundCloud scrape/api traffic goes through curl so it uses the region proxy
+// (Node's fetch has no SOCKS support). This is the key reason songverter (EU/US
+// egress) succeeds where a direct Singapore request is refused/geo-limited.
+async function scCurlText(url, signal, maxBytes) {
+  const r = await runTool("curl", curlBase([url]), { signal, timeoutMs: 45000, maxOutput: maxBytes || 6 * 1024 * 1024 });
+  if (r.aborted) throw new Error("aborted");
+  if (r.code !== 0 || !r.stdout) throw new Error("curl_exit_" + r.code);
+  return r.stdout;
+}
+async function scApiJson(url, signal) {
+  const r = await runTool("curl", curlBase(["-w", "\\n%{http_code}", url]), { signal, timeoutMs: 45000, maxOutput: 8 * 1024 * 1024 });
+  if (r.aborted) throw new Error("aborted");
+  if (r.code !== 0) throw new Error("curl_exit_" + r.code);
+  const body = r.stdout || "";
+  const nl = body.lastIndexOf("\n");
+  const status = parseInt(body.slice(nl + 1).trim(), 10) || 0;
+  if (status === 401 || status === 403) scCachedClientId = "";
+  if (status < 200 || status >= 300) throw new Error("api_" + status);
+  try { return JSON.parse(body.slice(0, nl)); } catch (_) { throw new Error("api_badjson"); }
 }
 async function scGetClientId(signal, force) {
   if (scCachedClientId && !force) return scCachedClientId;
-  const home = await (await fetch("https://soundcloud.com/", { headers: scHeaders(), signal })).text();
+  const home = await scCurlText("https://soundcloud.com/", signal, 4 * 1024 * 1024);
   const scripts = [...home.matchAll(/<script[^>]+src="([^"]+\.js[^"]*)"/g)].map((m) => m[1]);
   // The client_id lives in one of the app bundles; the later ones are likeliest.
   for (const src of scripts.reverse()) {
     try {
-      const js = await (await fetch(src, { headers: scHeaders(), signal })).text();
+      const js = await scCurlText(src, signal, 12 * 1024 * 1024);
       const m = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{22,})"/);
       if (m) { scCachedClientId = m[1]; return scCachedClientId; }
     } catch (_) {}
@@ -185,16 +202,10 @@ function scMapTrack(t) {
   return {
     title: t.title || titleFromUrl(t.permalink_url || ""),
     url: t.permalink_url || "",
-    uploader: (t.user && t.user.username) || t.publisher_metadata?.artist || "",
+    uploader: (t.user && t.user.username) || (t.publisher_metadata && t.publisher_metadata.artist) || "",
     duration: typeof t.duration === "number" ? Math.round(t.duration / 1000) : null,
     thumbnail: t.artwork_url || (t.user && t.user.avatar_url) || "",
   };
-}
-async function scApiJson(url, signal) {
-  const r = await fetch(url, { headers: scHeaders(), signal });
-  if (r.status === 401 || r.status === 403) { scCachedClientId = ""; }
-  if (!r.ok) throw new Error("api_" + r.status);
-  return r.json();
 }
 // Build a "related tracks" playlist from a seed track id — SoundCloud's public
 // recommendation endpoint (the same source its web player uses for personalized/
@@ -290,23 +301,29 @@ function curlBase(extra) {
 // does NOT decrypt anything — it uses the same public progressive file the site
 // serves. Returns the CDN URL string, or null.
 async function scProgressiveMediaUrl(trackUrl, signal, deadline) {
-  const cid = await scGetClientId(signal, false).catch(() => null);
-  if (!cid) return null;
-  const budget = () => Math.max(1, Math.min(60000, deadline - Date.now()));
-  const getJson = async (u) => {
-    const r = await runTool("curl", curlBase([u]), { signal, timeoutMs: budget(), maxOutput: 6 * 1024 * 1024 });
-    if (r.aborted || r.code !== 0 || !r.stdout) return null;
-    try { return JSON.parse(r.stdout); } catch (_) { return null; }
-  };
-  const track = await getJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`);
-  if (!track || track.kind !== "track") return null;
+  let cid;
+  try { cid = await scGetClientId(signal, false); }
+  catch (e) { console.warn("[direct] client_id failed:", e.message); return null; }
+  let track;
+  try { track = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`, signal); }
+  catch (e) {
+    // Stale client_id → re-scrape once and retry.
+    try { cid = await scGetClientId(signal, true); track = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`, signal); }
+    catch (e2) { console.warn("[direct] track resolve failed:", e2.message); return null; }
+  }
+  if (!track || track.kind !== "track") { console.warn("[direct] not a track:", track && track.kind); return null; }
   const trans = track.media && Array.isArray(track.media.transcodings) ? track.media.transcodings : [];
+  console.warn("[direct] transcodings:", (trans.map((t) => t.format && t.format.protocol + (t.snipped ? "/snip" : "")).join(", ") || "none"), "| track_authorization:", track.track_authorization ? "yes" : "no");
   const isProg = (t) => t && t.url && t.format && t.format.protocol === "progressive";
   const prog = trans.find((t) => isProg(t) && !t.snipped) || trans.find(isProg);
-  if (!prog) return null;
+  if (!prog) { console.warn("[direct] no progressive rendition"); return null; }
   const ta = track.track_authorization ? `&track_authorization=${encodeURIComponent(track.track_authorization)}` : "";
-  const stream = await getJson(`${prog.url}?client_id=${cid}${ta}`);
-  return stream && typeof stream.url === "string" ? stream.url : null;
+  let stream;
+  try { stream = await scApiJson(`${prog.url}?client_id=${cid}${ta}`, signal); }
+  catch (e) { console.warn("[direct] stream resolve failed:", e.message); return null; }
+  if (!stream || typeof stream.url !== "string") { console.warn("[direct] no stream url in response"); return null; }
+  console.warn("[direct] progressive media url resolved OK");
+  return stream.url;
 }
 
 function soundCloudArgs() {

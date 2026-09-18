@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1
+
+- Route ALL SoundCloud api-v2 / client_id traffic through `curl` (which honours the region proxy) instead of Node's global `fetch` (no SOCKS support). A direct Singapore request was being refused/limited, which silently broke both the personalized "related tracks" resolve (1.4.1) and the progressive/`track_authorization` recovery (1.5.0). Now everything resolves from the allowed region, like the web player.
+- Added `[direct]`/`[resolve]` diagnostics (transcodings list, track_authorization presence, failure reason) so download-path failures are traceable in `pm2 logs`.
+
 ## 1.5.0
 
 - Full-audio recovery for tracks yt-dlp reports as "DRM protected"/geo/unavailable. yt-dlp resolves SoundCloud streams with a `client_id` only and is then offered nothing but encrypted-HLS on some tracks, so it declares DRM — even though SoundCloud still serves a normal **progressive** file when asked with the track's `track_authorization` (exactly what the web player and web downloaders use). On such a failure, the backend now reads the track's `media.transcodings` + `track_authorization` (via `curl` through the region proxy so it resolves from the allowed region), picks the progressive rendition, and hands that direct CDN URL to yt-dlp to download and convert — a full track, not a preview. Does not decrypt DRM; uses the same public progressive file the site serves.
