@@ -300,31 +300,55 @@ function curlBase(extra) {
 // track_authorization) and is then offered only the encrypted-HLS rendition. It
 // does NOT decrypt anything — it uses the same public progressive file the site
 // serves. Returns the CDN URL string, or null.
+// Ask the media endpoint for the real CDN URL of one transcoding. SoundCloud's
+// newer streams are unlocked by the track's track_authorization (the web player
+// sends that WITHOUT a client_id); older ones need client_id. Try both forms.
+async function scResolveTranscoding(tUrl, cid, ta, signal) {
+  const sep = tUrl.includes("?") ? "&" : "?";
+  const forms = [];
+  if (ta) forms.push(`${tUrl}${sep}track_authorization=${ta}`);
+  if (ta) forms.push(`${tUrl}${sep}client_id=${cid}&track_authorization=${ta}`);
+  forms.push(`${tUrl}${sep}client_id=${cid}`);
+  for (const u of forms) {
+    try { const j = await scApiJson(u, signal); if (j && typeof j.url === "string") return j.url; }
+    catch (_) { /* try next form */ }
+  }
+  return null;
+}
+// Resolve a downloadable media URL for a track that yt-dlp couldn't get. Reads the
+// track's media.transcodings + track_authorization and resolves the PROGRESSIVE
+// rendition first (plain file), then plain non-encrypted HLS. Skips *-encrypted-hls
+// (real DRM). Returns a URL yt-dlp can download+convert, or null.
 async function scProgressiveMediaUrl(trackUrl, signal, deadline) {
   let cid;
   try { cid = await scGetClientId(signal, false); }
   catch (e) { console.warn("[direct] client_id failed:", e.message); return null; }
+  const resolveTrack = async () => scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`, signal);
   let track;
-  try { track = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`, signal); }
+  try { track = await resolveTrack(); }
   catch (e) {
-    // Stale client_id → re-scrape once and retry.
-    try { cid = await scGetClientId(signal, true); track = await scApiJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`, signal); }
+    try { cid = await scGetClientId(signal, true); track = await resolveTrack(); }
     catch (e2) { console.warn("[direct] track resolve failed:", e2.message); return null; }
   }
   if (!track || track.kind !== "track") { console.warn("[direct] not a track:", track && track.kind); return null; }
   const trans = track.media && Array.isArray(track.media.transcodings) ? track.media.transcodings : [];
   console.warn("[direct] transcodings:", (trans.map((t) => t.format && t.format.protocol + (t.snipped ? "/snip" : "")).join(", ") || "none"), "| track_authorization:", track.track_authorization ? "yes" : "no");
-  const isProg = (t) => t && t.url && t.format && t.format.protocol === "progressive";
-  const prog = trans.find((t) => isProg(t) && !t.snipped) || trans.find(isProg);
-  if (!prog) { console.warn("[direct] no progressive rendition"); return null; }
-  const ta = track.track_authorization ? `&track_authorization=${encodeURIComponent(track.track_authorization)}` : "";
-  let stream;
-  try { stream = await scApiJson(`${prog.url}?client_id=${cid}${ta}`, signal); }
-  catch (e) { console.warn("[direct] stream resolve failed:", e.message); return null; }
-  if (!stream || typeof stream.url !== "string") { console.warn("[direct] no stream url in response"); return null; }
-  console.warn("[direct] progressive media url resolved OK");
-  return stream.url;
+  const ta = track.track_authorization ? encodeURIComponent(track.track_authorization) : "";
+  const proto = (t) => (t && t.format && t.format.protocol) || "";
+  // Progressive (plain file) first, then plain HLS. Encrypted-HLS is skipped.
+  const prog = trans.filter((t) => t && t.url && proto(t) === "progressive" && !t.snipped);
+  const hls = trans.filter((t) => t && t.url && proto(t) === "hls" && !t.snipped);
+  const candidates = [...prog, ...hls];
+  if (!candidates.length) { console.warn("[direct] no non-encrypted rendition (only encrypted-hls)"); return null; }
+  for (const c of candidates) {
+    if (controllerAborted(signal)) return null;
+    const media = await scResolveTranscoding(c.url, cid, ta, signal);
+    if (media) { console.warn("[direct] media url resolved via", proto(c)); return media; }
+  }
+  console.warn("[direct] all renditions failed to resolve a media url");
+  return null;
 }
+function controllerAborted(signal) { return signal && signal.aborted; }
 
 function soundCloudArgs() {
   // Explicitly try every format supported by the extractor. MP3 output does not

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.2
+
+- Media-URL resolution fixed and broadened. Diagnostics showed the progressive rendition exists (with `track_authorization`) but resolving it with `client_id`+`track_authorization` returned 404. SoundCloud's newer streams are unlocked by `track_authorization` sent WITHOUT a `client_id` (as the web player does), so we now try that form first, then `client_id`+`track_authorization`, then `client_id` alone. We also now fall back from progressive to plain (non-encrypted) `hls` before giving up; only `*-encrypted-hls` renditions are treated as unavailable.
+
 ## 1.5.1
 
 - Route ALL SoundCloud api-v2 / client_id traffic through `curl` (which honours the region proxy) instead of Node's global `fetch` (no SOCKS support). A direct Singapore request was being refused/limited, which silently broke both the personalized "related tracks" resolve (1.4.1) and the progressive/`track_authorization` recovery (1.5.0). Now everything resolves from the allowed region, like the web player.
