@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.0
+
+- Full-audio recovery for tracks yt-dlp reports as "DRM protected"/geo/unavailable. yt-dlp resolves SoundCloud streams with a `client_id` only and is then offered nothing but encrypted-HLS on some tracks, so it declares DRM — even though SoundCloud still serves a normal **progressive** file when asked with the track's `track_authorization` (exactly what the web player and web downloaders use). On such a failure, the backend now reads the track's `media.transcodings` + `track_authorization` (via `curl` through the region proxy so it resolves from the allowed region), picks the progressive rendition, and hands that direct CDN URL to yt-dlp to download and convert — a full track, not a preview. Does not decrypt DRM; uses the same public progressive file the site serves.
+- Order of fallbacks on `/download`: normal yt-dlp → direct progressive (full) → preview snippet → error.
+
 ## 1.4.1
 
 - Personalized/"related tracks" discover sets now resolve. For URLs like `/discover/sets/personalized-tracks::<user>:<seedTrackId>` (which 404 on `/resolve`), the backend reads the trailing seed track id and builds the set from that track's public `tracks/{id}/related` recommendations (plus the seed) — the same anonymous, client_id path SoundCloud's web player and web downloaders use. Tracks then download through the normal yt-dlp path.

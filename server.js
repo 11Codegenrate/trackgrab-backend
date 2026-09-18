@@ -272,6 +272,43 @@ async function scResolve(url, signal) {
   throw new Error("not_resolvable");
 }
 
+// curl argument list, routed through the SoundCloud proxy when configured so the
+// request egresses from the allowed region (curl speaks socks5h/http, unlike
+// Node's fetch). Callers append their own URL (and -o file for downloads).
+function curlBase(extra) {
+  const a = ["-s", "-L", "--max-time", "120"];
+  if (SOUNDCLOUD_PROXY) a.push("--proxy", SOUNDCLOUD_PROXY);
+  a.push("-A", `Mozilla/5.0 (compatible; ScloudTrackGrab/${BACKEND_VERSION})`);
+  return a.concat(extra || []);
+}
+// Resolve a track's direct PROGRESSIVE media URL via api-v2, the way SoundCloud's
+// web player (and web downloaders) do: read the track's media.transcodings and
+// its track_authorization, pick the progressive (plain file) rendition, and ask
+// the media endpoint for the CDN URL. This recovers tracks that yt-dlp reports as
+// "DRM protected" only because it resolves streams with client_id alone (no
+// track_authorization) and is then offered only the encrypted-HLS rendition. It
+// does NOT decrypt anything — it uses the same public progressive file the site
+// serves. Returns the CDN URL string, or null.
+async function scProgressiveMediaUrl(trackUrl, signal, deadline) {
+  const cid = await scGetClientId(signal, false).catch(() => null);
+  if (!cid) return null;
+  const budget = () => Math.max(1, Math.min(60000, deadline - Date.now()));
+  const getJson = async (u) => {
+    const r = await runTool("curl", curlBase([u]), { signal, timeoutMs: budget(), maxOutput: 6 * 1024 * 1024 });
+    if (r.aborted || r.code !== 0 || !r.stdout) return null;
+    try { return JSON.parse(r.stdout); } catch (_) { return null; }
+  };
+  const track = await getJson(`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${cid}`);
+  if (!track || track.kind !== "track") return null;
+  const trans = track.media && Array.isArray(track.media.transcodings) ? track.media.transcodings : [];
+  const isProg = (t) => t && t.url && t.format && t.format.protocol === "progressive";
+  const prog = trans.find((t) => isProg(t) && !t.snipped) || trans.find(isProg);
+  if (!prog) return null;
+  const ta = track.track_authorization ? `&track_authorization=${encodeURIComponent(track.track_authorization)}` : "";
+  const stream = await getJson(`${prog.url}?client_id=${cid}${ta}`);
+  return stream && typeof stream.url === "string" ? stream.url : null;
+}
+
 function soundCloudArgs() {
   // Explicitly try every format supported by the extractor. MP3 output does not
   // require an MP3 source; AAC/Opus are converted by FFmpeg. Local yt-dlp config
@@ -647,6 +684,7 @@ app.get("/download", (req, res) => {
       let result, produced, info, isPreview = false;
       let includeMeta = opts.meta;
       let triedPreviewFallback = false;
+      let triedDirect = false;
       for (let attempt = 0; attempt < DOWNLOAD_ATTEMPTS; attempt++) {
         const attemptDir = path.join(workDir, String(attempt));
         fs.mkdirSync(attemptDir);
@@ -685,6 +723,40 @@ app.get("/download", (req, res) => {
           !["drm_protected", "geo_restricted", "track_private", "rate_limited", "preview_only"].includes(info.code);
         if (optionalMetaFailure) includeMeta = false;
         if (attempt + 1 >= DOWNLOAD_ATTEMPTS || (!optionalMetaFailure && !info.retryable) || Date.now() >= deadline) {
+          // FULL-audio recovery: yt-dlp reports "DRM protected"/geo/unavailable for
+          // some tracks only because it resolves streams with client_id alone and is
+          // offered nothing but encrypted-HLS. SoundCloud still serves a normal
+          // PROGRESSIVE file when asked with the track's track_authorization (what the
+          // web player and web downloaders use). Resolve that direct media URL and let
+          // yt-dlp download+convert it — a full track, not a preview.
+          const directCodes = ["drm_protected", "geo_restricted", "audio_unavailable", "upstream_forbidden", "preview_only", "download_failed", "upstream_unavailable"];
+          if (!triedDirect && directCodes.includes(info.code) && !controller.signal.aborted && !res.destroyed && Date.now() < deadline) {
+            triedDirect = true;
+            try {
+              const mediaUrl = await scProgressiveMediaUrl(url, controller.signal, deadline);
+              if (mediaUrl && !controller.signal.aborted && !res.destroyed) {
+                const dDir = path.join(workDir, "direct");
+                fs.mkdirSync(dDir);
+                const dOut = path.join(dDir, "audio.%(ext)s");
+                const dr = await runTool(YTDLP_BIN, [
+                  ...soundCloudArgs(), ...buildYtdlpArgs(fmt, { ...opts, meta: false }),
+                  "--retries", "3", "--postprocessor-args", "ffmpeg:-threads 2",
+                  ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
+                  ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
+                  "--no-mtime", "--no-progress", "--no-simulate",
+                  "--print", "after_move:TRACKGRAB_FILE:%(filepath)s", "-o", dOut, "--", mediaUrl,
+                ], { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) });
+                if (dr.aborted || controller.signal.aborted || res.destroyed) return;
+                if (dr.code === 0 && !dr.signal && !dr.error && !dr.timedOut) {
+                  const doneD = dr.stdout.split(/\r?\n/).filter((line) => line.startsWith("TRACKGRAB_FILE:")).map((line) => line.slice("TRACKGRAB_FILE:".length));
+                  const candsD = [...new Set([fmt.audioFormat, fmt.ext])].map((ext) => path.join(dDir, `audio.${ext}`));
+                  const pD = candsD.find((file) => doneD.some((name) => path.resolve(name) === path.resolve(file)) && fs.existsSync(file) && fs.statSync(file).size > 0);
+                  if (pD) { produced = pD; isPreview = false; break; }
+                }
+                console.warn(`[download] direct-progressive fallback failed code=${dr.code} ${dr.stderr || dr.error?.message || ""}`);
+              }
+            } catch (directErr) { console.warn("[download] direct-progressive resolve failed:", directErr.message); }
+          }
           // Last resort so no listed track hard-fails: when SoundCloud gave us no
           // usable full/available stream (geo, Go+/DRM, "preview only", forbidden),
           // try once more forcing ANY playable source — including the public 30s
