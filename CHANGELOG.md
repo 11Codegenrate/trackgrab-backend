@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.3
+
+- Send `Authorization: OAuth <SOUNDCLOUD_OAUTH_TOKEN>` on the api-v2 media/resolve requests when a token is configured. Diagnostics showed the progressive/plain-hls media endpoints return 401 to anonymous (client_id/track_authorization-only) requests for some tracks — SoundCloud's web player authenticates with an OAuth token, which is what unlocks these renditions. With a token set (any account; also used by yt-dlp via cookies), the progressive recovery path can resolve a real media URL.
+
 ## 1.5.2
 
 - Media-URL resolution fixed and broadened. Diagnostics showed the progressive rendition exists (with `track_authorization`) but resolving it with `client_id`+`track_authorization` returned 404. SoundCloud's newer streams are unlocked by `track_authorization` sent WITHOUT a `client_id` (as the web player does), so we now try that form first, then `client_id`+`track_authorization`, then `client_id` alone. We also now fall back from progressive to plain (non-encrypted) `hls` before giving up; only `*-encrypted-hls` renditions are treated as unavailable.

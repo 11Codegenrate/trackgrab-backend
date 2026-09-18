@@ -290,6 +290,10 @@ function curlBase(extra) {
   const a = ["-s", "-L", "--max-time", "120"];
   if (SOUNDCLOUD_PROXY) a.push("--proxy", SOUNDCLOUD_PROXY);
   a.push("-A", `Mozilla/5.0 (compatible; ScloudTrackGrab/${BACKEND_VERSION})`);
+  // SoundCloud's media/stream endpoints reject anonymous (client_id-only) requests
+  // for some tracks with 401 — the web player authenticates with an OAuth token.
+  // Send one when configured so progressive/hls renditions unlock like the site.
+  if (SOUNDCLOUD_OAUTH_TOKEN) a.push("-H", `Authorization: OAuth ${SOUNDCLOUD_OAUTH_TOKEN}`);
   return a.concat(extra || []);
 }
 // Resolve a track's direct PROGRESSIVE media URL via api-v2, the way SoundCloud's
