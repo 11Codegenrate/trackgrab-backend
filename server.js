@@ -612,13 +612,53 @@ function retryDelay(ms, signal) {
 // Bounds concurrent yt-dlp/ffmpeg jobs so the box stays responsive, and lets
 // Pro ("priority") downloads jump ahead of the free queue — the server side of
 // "priority server queue / faster processing". Tune with MAX_CONCURRENT env.
-const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT || "2", 10) || 2);
+const MAX_CONCURRENT = Math.max(1, parseInt(process.env.MAX_CONCURRENT || "3", 10) || 3);
 const MAX_QUEUE = Math.max(1, parseInt(process.env.MAX_QUEUE || "30", 10) || 30);
 const DOWNLOAD_TIMEOUT_S = Math.max(60, parseInt(process.env.DOWNLOAD_TIMEOUT_S || "900", 10) || 900);
-// Parallel HLS fragment downloads per yt-dlp job. 4 is a good default; raise via
-// YTDLP_FRAGMENTS on a beefier box, but keep it modest so N jobs × N fragments
-// don't saturate the network.
-const YTDLP_FRAGMENTS = Math.min(8, Math.max(1, parseInt(process.env.YTDLP_FRAGMENTS || "4", 10) || 4));
+// Parallel HLS fragment downloads per yt-dlp job (the fallback when aria2c is not
+// used). 8 is a good default; raise via YTDLP_FRAGMENTS on a beefier box, but keep
+// it modest so N jobs × N fragments don't saturate the network.
+const YTDLP_FRAGMENTS = Math.min(16, Math.max(1, parseInt(process.env.YTDLP_FRAGMENTS || "8", 10) || 8));
+
+// ── Download acceleration (aria2c external downloader) ───────────────────────
+// The main lever for "maximum download speed" on a single track: SoundCloud's
+// progressive rendition is one HTTP file, so yt-dlp's native single-connection
+// download is CDN-latency bound. aria2c opens many parallel connections/segments
+// to the same CDN file and downloads it several times faster — and it also speeds
+// up HLS by fetching fragments in parallel. Used AUTOMATICALLY when the aria2c
+// binary is available AND it is safe with the current proxy. IMPORTANT: aria2c
+// has no SOCKS support, so when SOUNDCLOUD_PROXY is a socks proxy we fall back to
+// yt-dlp's native downloader (which does route through SOCKS) — otherwise proxied,
+// region-locked tracks would break. Override with YTDLP_DOWNLOADER=auto|native|aria2c.
+const ARIA2C_BIN = process.env.ARIA2C_PATH || "aria2c";
+const DOWNLOADER_MODE = String(process.env.YTDLP_DOWNLOADER || "auto").trim().toLowerCase();
+const ARIA2C_CONNECTIONS = Math.min(16, Math.max(2, parseInt(process.env.ARIA2C_CONNECTIONS || "16", 10) || 16));
+const PROXY_IS_SOCKS = /^socks/i.test(SOUNDCLOUD_PROXY);
+let ARIA2C_OK = false; // probed at boot by selfCheck(); false until then (fail-safe to native).
+
+function aria2cEnabled() {
+  if (DOWNLOADER_MODE === "native") return false;
+  if (!ARIA2C_OK) return false; // binary must actually be runnable.
+  if (DOWNLOADER_MODE === "aria2c") return true; // forced, and available.
+  // auto: use it unless a SOCKS proxy (which aria2c can't speak) is configured.
+  return !(SOUNDCLOUD_PROXY && PROXY_IS_SOCKS);
+}
+
+// yt-dlp download-acceleration args. Prefer aria2c (many parallel connections) when
+// available and proxy-safe; otherwise fall back to yt-dlp's native parallel HLS
+// fragments. Applied to EVERY download attempt (normal, direct-progressive, preview)
+// so single tracks and playlist tracks alike get maximum throughput.
+function speedArgs() {
+  if (aria2cEnabled()) {
+    const c = String(ARIA2C_CONNECTIONS);
+    return [
+      "--downloader", ARIA2C_BIN,
+      "--downloader-args",
+      `aria2c:-x${c} -s${c} -j${c} -k1M --min-split-size=1M --max-connection-per-server=${c} --file-allocation=none --console-log-level=warn`,
+    ];
+  }
+  return ["--concurrent-fragments", String(YTDLP_FRAGMENTS)];
+}
 const DOWNLOAD_ATTEMPTS = Math.min(3, Math.max(1, parseInt(process.env.DOWNLOAD_ATTEMPTS || "2", 10) || 2));
 const DOWNLOAD_RETRY_DELAY_MS = Math.min(10000, Math.max(0, Number(process.env.DOWNLOAD_RETRY_DELAY_MS ?? "2000") || 0));
 const DOWNLOAD_QUEUE_TIMEOUT_S = Math.max(1, parseInt(process.env.DOWNLOAD_QUEUE_TIMEOUT_S || "60", 10) || 60);
@@ -740,7 +780,7 @@ app.get("/download", (req, res) => {
           // SoundCloud exposes. Prefer full streams explicitly; check availability
           // before selection so a dead rendition does not hide a usable one.
           "--format", "bestaudio[format_id!*=preview]/best[format_id!*=preview]/bestaudio/best", "--check-formats",
-          "--concurrent-fragments", String(YTDLP_FRAGMENTS), "--retries", "3", "--fragment-retries", "5",
+          ...speedArgs(), "--retries", "3", "--fragment-retries", "5",
           "--abort-on-unavailable-fragments", "--postprocessor-args", "ffmpeg:-threads 2",
           ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
           ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
@@ -785,7 +825,7 @@ app.get("/download", (req, res) => {
                 const dOut = path.join(dDir, "audio.%(ext)s");
                 const dr = await runTool(YTDLP_BIN, [
                   ...soundCloudArgs(), ...buildYtdlpArgs(fmt, { ...opts, meta: false }),
-                  "--retries", "3", "--postprocessor-args", "ffmpeg:-threads 2",
+                  ...speedArgs(), "--retries", "3", "--postprocessor-args", "ffmpeg:-threads 2",
                   ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
                   ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
                   "--no-mtime", "--no-progress", "--no-simulate",
@@ -819,7 +859,7 @@ app.get("/download", (req, res) => {
               // Accept anything playable, preview snippet included; no format
               // pre-check and skip (don't abort on) unavailable fragments.
               "--format", "bestaudio/best/worst",
-              "--concurrent-fragments", String(YTDLP_FRAGMENTS), "--retries", "3", "--fragment-retries", "5",
+              ...speedArgs(), "--retries", "3", "--fragment-retries", "5",
               "--no-abort-on-unavailable-fragments", "--postprocessor-args", "ffmpeg:-threads 2",
               ...(extractAudioCbrArgs(fmt, opts) ? ["--postprocessor-args", "ExtractAudio:" + extractAudioCbrArgs(fmt, opts)] : []),
               ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
@@ -908,6 +948,8 @@ app.get("/diag", (req, res) => {
     uptimeSeconds: Math.floor(process.uptime()),
     // Region-recovery status: confirm the proxy/geo-bypass you configured is live.
     region: { proxy: SOUNDCLOUD_PROXY ? "configured" : "none", geoBypass: GEO_BYPASS_OFF ? "off" : (GEO_BYPASS_COUNTRY || "auto"), previewFallback: true, auth: SOUNDCLOUD_COOKIE_FILE ? (SOUNDCLOUD_COOKIES ? "cookies" : "oauth") : "none" },
+    // Download-acceleration status: confirm aria2c is live so single tracks reach top speed.
+    speed: { downloader: aria2cEnabled() ? "aria2c" : "native", aria2c: ARIA2C_OK ? "available" : "not found", mode: DOWNLOADER_MODE, connections: ARIA2C_CONNECTIONS, fragments: YTDLP_FRAGMENTS, proxySocks: PROXY_IS_SOCKS },
     downloads: { active: activeJobs, queued: jobQueue.length, concurrency: MAX_CONCURRENT, queueLimit: MAX_QUEUE, attempts: DOWNLOAD_ATTEMPTS, queueTimeoutSeconds: DOWNLOAD_QUEUE_TIMEOUT_S, shuttingDown },
     converter: convertRouter.getStatus(),
     memory: process.memoryUsage(),
@@ -975,6 +1017,15 @@ function selfCheck() {
     console.log(r.ok ? `✓ ${r.version}` : `✗ ffmpeg NOT RUNNABLE at "${ff}" (${r.error}) — install ffmpeg/ffprobe or set FFMPEG_LOCATION; ALL downloads will 500`));
   toolVersion(ffprobeProbePath(), ["-version"], (r) =>
     console.log(r.ok ? `✓ ${r.version}` : `✗ ffprobe NOT RUNNABLE (${r.error}) — downloads cannot be verified`));
+  // Probe aria2c so accelerated downloads turn on automatically when it's installed.
+  toolVersion(ARIA2C_BIN, ["--version"], (r) => {
+    ARIA2C_OK = !!r.ok;
+    if (r.ok) {
+      console.log(`✓ ${String(r.version).split(" ").slice(0, 2).join(" ")} — accelerated downloads ${aria2cEnabled() ? "ON" : "OFF (SOCKS proxy or disabled)"}`);
+    } else {
+      console.log(`• aria2c not found (${r.error}) — using yt-dlp native downloader. Install aria2c for much faster single-track/playlist downloads.`);
+    }
+  });
 }
 
 const PORT = process.env.PORT || 3001;

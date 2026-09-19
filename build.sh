@@ -46,6 +46,19 @@ else
 fi
 rm -rf "$TMP_FF"
 
+echo "==> Installing aria2c (accelerated downloads)"
+# aria2c gives single-track/playlist downloads a big speed-up (many parallel CDN
+# connections). The backend auto-detects it and falls back to yt-dlp's native
+# downloader if it's absent, so this is best-effort and never fails the build.
+if command -v aria2c >/dev/null 2>&1; then
+  echo "aria2c already present: $(aria2c --version | head -n1)"
+elif command -v apt-get >/dev/null 2>&1; then
+  (apt-get update -y && apt-get install -y aria2 && aria2c --version | head -n1) \
+    || echo "!! aria2 install failed — backend will use yt-dlp native downloader." >&2
+else
+  echo "!! No apt-get and no aria2c on PATH — set ARIA2C_PATH or install aria2 for faster downloads." >&2
+fi
+
 echo "==> Installing locked npm dependencies"
 npm ci --omit=dev
 

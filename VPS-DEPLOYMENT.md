@@ -92,6 +92,21 @@ pm2 restart trackgrab --update-env
 
 For a package-managed installation, use its supported package manager. Confirm `/diag` probes the same executable path used by the service.
 
+## Enable accelerated downloads (aria2c) — 1.6.0+
+
+Single-track and playlist downloads are much faster when `aria2c` is installed (the backend opens up to 16 parallel connections per track). Install it once on the VPS, then restart:
+
+```bash
+sudo apt-get update -y && sudo apt-get install -y aria2
+pm2 restart trackgrab --update-env
+```
+
+Confirm at `/diag` → `speed` (e.g. `{ "downloader": "aria2c", "aria2c": "available", "connections": 16 }`). If aria2c is absent the backend automatically uses yt-dlp's native downloader — nothing breaks, downloads are just slower.
+
+Notes:
+- aria2c has **no SOCKS support**. If `SOUNDCLOUD_PROXY` is a `socks5://`/`socks5h://` proxy, the backend keeps the native downloader on purpose so region-locked/proxied tracks keep working (`/diag` → `speed.downloader` will read `native`). Use an `http(s)://` region proxy to get both acceleration *and* geo-bypass.
+- Tune with env vars: `YTDLP_DOWNLOADER=auto|native|aria2c`, `ARIA2C_CONNECTIONS` (default 16), `ARIA2C_PATH` (custom binary path), `MAX_CONCURRENT` (default 3).
+
 ## Verify an available track from the same VPS
 
 Choose a public SoundCloud track you are authorized to download and test from the same VPS where the application runs. Use the executable reported by `/diag` if `YTDLP_PATH` is configured. First check available formats, then produce an MP3:

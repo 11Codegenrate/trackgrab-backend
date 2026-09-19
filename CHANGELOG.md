@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.0
+
+- **Maximum download speed.** Added the aria2c external downloader, used automatically for every download (normal, direct-progressive recovery, and preview fallback) when the `aria2c` binary is available. SoundCloud's progressive rendition is a single HTTP file, so yt-dlp's native one-connection download is latency-bound; aria2c opens up to 16 parallel connections/segments to the same CDN file and pulls it several times faster — the main lever for fast single-track downloads. It also parallelizes HLS fragments. **Proxy safety:** aria2c has no SOCKS support, so when `SOUNDCLOUD_PROXY` is a `socks*` proxy we keep yt-dlp's native downloader (which does route through SOCKS), so region-locked/proxied tracks never break. Tune with `YTDLP_DOWNLOADER=auto|native|aria2c`, `ARIA2C_CONNECTIONS` (default 16), `ARIA2C_PATH`.
+- Raised default concurrency: `MAX_CONCURRENT` 2→3 and native `YTDLP_FRAGMENTS` 4→8 (clamped to 16). Both still env-tunable.
+- `/diag` now reports a `speed` block (`downloader`, `aria2c` availability, `mode`, `connections`, `fragments`) so you can confirm acceleration is live. Boot log prints whether aria2c is on.
+- No change to download accuracy: the ffprobe container/codec verification and true-CBR MP3 enforcement are untouched, so files stay exactly the requested format/bitrate. **Deploy note:** install aria2c on the VPS (`apt-get install -y aria2`) to enable the speed-up; without it the backend automatically uses the native downloader.
+
 ## 1.5.3
 
 - Send `Authorization: OAuth <SOUNDCLOUD_OAUTH_TOKEN>` on the api-v2 media/resolve requests when a token is configured. Diagnostics showed the progressive/plain-hls media endpoints return 401 to anonymous (client_id/track_authorization-only) requests for some tracks — SoundCloud's web player authenticates with an OAuth token, which is what unlocks these renditions. With a token set (any account; also used by yt-dlp via cookies), the progressive recovery path can resolve a real media URL.
