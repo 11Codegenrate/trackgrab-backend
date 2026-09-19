@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.1
+
+- **Fix: HLS tracks were slow even with aria2c on.** SoundCloud's "best" audio is usually HLS (m3u8), which yt-dlp downloads with its NATIVE fragment downloader even when aria2c is set as the external downloader. 1.6.0's `speedArgs()` dropped `--concurrent-fragments` whenever aria2c was enabled, so HLS fragments were fetched ONE AT A TIME and crawled over a high-latency region proxy (observed ~184 KiB/s / ~14s for a 2.7 MiB track). `speedArgs()` now ALWAYS passes `--concurrent-fragments` (so HLS fragments download in parallel) in addition to aria2c for progressive single-file downloads. Tune fragment parallelism with `YTDLP_FRAGMENTS` (default 8; set 16 for max on a good box).
+
 ## 1.6.0
 
 - **Maximum download speed.** Added the aria2c external downloader, used automatically for every download (normal, direct-progressive recovery, and preview fallback) when the `aria2c` binary is available. SoundCloud's progressive rendition is a single HTTP file, so yt-dlp's native one-connection download is latency-bound; aria2c opens up to 16 parallel connections/segments to the same CDN file and pulls it several times faster — the main lever for fast single-track downloads. It also parallelizes HLS fragments. **Proxy safety:** aria2c has no SOCKS support, so when `SOUNDCLOUD_PROXY` is a `socks*` proxy we keep yt-dlp's native downloader (which does route through SOCKS), so region-locked/proxied tracks never break. Tune with `YTDLP_DOWNLOADER=auto|native|aria2c`, `ARIA2C_CONNECTIONS` (default 16), `ARIA2C_PATH`.

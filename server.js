@@ -649,15 +649,23 @@ function aria2cEnabled() {
 // fragments. Applied to EVERY download attempt (normal, direct-progressive, preview)
 // so single tracks and playlist tracks alike get maximum throughput.
 function speedArgs() {
+  // ALWAYS parallelize HLS fragments. SoundCloud's "best" audio is usually HLS (m3u8),
+  // and yt-dlp downloads HLS with its NATIVE downloader one fragment at a time even
+  // when aria2c is the external downloader — so without --concurrent-fragments those
+  // fragments are fetched serially and crawl over a high-latency region proxy (the
+  // "aria2c on but still slow" case). aria2c still accelerates the progressive
+  // (single-file) downloads on top of this.
+  const frags = ["--concurrent-fragments", String(YTDLP_FRAGMENTS)];
   if (aria2cEnabled()) {
     const c = String(ARIA2C_CONNECTIONS);
     return [
+      ...frags,
       "--downloader", ARIA2C_BIN,
       "--downloader-args",
       `aria2c:-x${c} -s${c} -j${c} -k1M --min-split-size=1M --max-connection-per-server=${c} --file-allocation=none --console-log-level=warn`,
     ];
   }
-  return ["--concurrent-fragments", String(YTDLP_FRAGMENTS)];
+  return frags;
 }
 const DOWNLOAD_ATTEMPTS = Math.min(3, Math.max(1, parseInt(process.env.DOWNLOAD_ATTEMPTS || "2", 10) || 2));
 const DOWNLOAD_RETRY_DELAY_MS = Math.min(10000, Math.max(0, Number(process.env.DOWNLOAD_RETRY_DELAY_MS ?? "2000") || 0));
